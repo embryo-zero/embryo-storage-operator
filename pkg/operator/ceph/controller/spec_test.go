@@ -1,0 +1,949 @@
+/*
+Copyright 2018 The Rook Authors. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/go-ini/ini"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
+	"github.com/rook/rook/pkg/clusterd"
+	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/operator/test"
+	exectest "github.com/rook/rook/pkg/util/exec/test"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	appsv1 "k8s.io/api/apps/v1"
+	v1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+func TestPodVolumes(t *testing.T) {
+	clusterSpec := cephv1.ClusterSpec{
+		DataDirHostPath: "/var/lib/rook/",
+	}
+	dataPathMap := config.NewDatalessDaemonDataPathMap("rook-ceph", "/var/lib/rook")
+
+	if err := test.VolumeIsEmptyDir(k8sutil.DataDirVolume, PodVolumes(dataPathMap, "", clusterSpec.DataDirHostPath, false)); err != nil {
+		t.Errorf("PodVolumes(\"\") - data dir source is not EmptyDir: %s", err.Error())
+	}
+	if err := test.VolumeIsHostPath(k8sutil.DataDirVolume, "/dev/sdb", PodVolumes(dataPathMap, "/dev/sdb", clusterSpec.DataDirHostPath, false)); err != nil {
+		t.Errorf("PodVolumes(\"/dev/sdb\") - data dir source is not HostPath: %s", err.Error())
+	}
+}
+
+func TestMountsMatchVolumes(t *testing.T) {
+	clusterSpec := cephv1.ClusterSpec{
+		DataDirHostPath: "/var/lib/rook/",
+	}
+
+	dataPathMap := config.NewDatalessDaemonDataPathMap("rook-ceph", "/var/lib/rook")
+
+	volsMountsTestDef := test.VolumesAndMountsTestDefinition{
+		VolumesSpec: &test.VolumesSpec{
+			Moniker: "PodVolumes(\"/dev/sdc\")", Volumes: PodVolumes(dataPathMap, "/dev/sdc", clusterSpec.DataDirHostPath, false),
+		},
+		MountsSpecItems: []*test.MountsSpec{
+			{Moniker: "CephVolumeMounts(true)", Mounts: CephVolumeMounts(dataPathMap, false)},
+			{Moniker: "RookVolumeMounts(true)", Mounts: RookVolumeMounts(dataPathMap, false)},
+		},
+	}
+	volsMountsTestDef.TestMountsMatchVolumes(t)
+
+	volsMountsTestDef = test.VolumesAndMountsTestDefinition{
+		VolumesSpec: &test.VolumesSpec{
+			Moniker: "PodVolumes(\"/dev/sdc\")", Volumes: PodVolumes(dataPathMap, "/dev/sdc", clusterSpec.DataDirHostPath, true),
+		},
+		MountsSpecItems: []*test.MountsSpec{
+			{Moniker: "CephVolumeMounts(false)", Mounts: CephVolumeMounts(dataPathMap, true)},
+			{Moniker: "RookVolumeMounts(false)", Mounts: RookVolumeMounts(dataPathMap, true)},
+		},
+	}
+	volsMountsTestDef.TestMountsMatchVolumes(t)
+}
+
+func TestConfigOverrideVolumeIsOptional(t *testing.T) {
+	dataPaths := config.NewDatalessDaemonDataPathMap("rook-ceph-test", "/var/lib/rook")
+	override, _ := ConfigOverrideConfigMapVolumeAndMount()
+
+	for _, tt := range []struct {
+		name    string
+		volumes []v1.Volume
+	}{
+		{name: "direct helper", volumes: []v1.Volume{override}},
+		{name: "OSD volumes", volumes: PodVolumes(dataPaths, "", "", false)},
+		{name: "daemon base volumes", volumes: DaemonVolumesBase(dataPaths, "", "")},
+		{name: "daemon volumes", volumes: DaemonVolumes(dataPaths, "", "")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			found := false
+			for _, volume := range tt.volumes {
+				if volume.Name != k8sutil.ConfigOverrideName {
+					continue
+				}
+				found = true
+				require.NotNil(t, volume.Projected)
+				require.Len(t, volume.Projected.Sources, 1)
+				projection := volume.Projected.Sources[0].ConfigMap
+				require.NotNil(t, projection)
+				require.NotNil(t, projection.Optional)
+				assert.True(t, *projection.Optional)
+				assert.Equal(t, k8sutil.ConfigOverrideName, projection.Name)
+				require.Len(t, projection.Items, 1)
+				assert.Equal(t, k8sutil.ConfigOverrideVal, projection.Items[0].Key)
+				assert.Equal(t, "ceph.conf", projection.Items[0].Path)
+				require.NotNil(t, projection.Items[0].Mode)
+				assert.Equal(t, int32(0o444), *projection.Items[0].Mode)
+			}
+			assert.True(t, found)
+		})
+	}
+}
+
+func TestCheckPodMemory(t *testing.T) {
+	// This value is in MB
+	const PodMinimumMemory uint64 = 1024
+	name := "test"
+
+	// A value for the memory used in the tests
+	// nolint:gosec // G115 no overflow expected in the test
+	memory_value := int64(PodMinimumMemory * 8 * uint64(math.Pow10(6)))
+
+	// Case 1: No memory limits, no memory requested
+	test_resource := v1.ResourceRequirements{}
+
+	if err := CheckPodMemory(name, test_resource, PodMinimumMemory); err != nil {
+		t.Errorf("Error case 1: %s", err.Error())
+	}
+
+	// Case 2: memory limit and memory requested
+	test_resource = v1.ResourceRequirements{
+		Limits: v1.ResourceList{
+			v1.ResourceMemory: *resource.NewQuantity(memory_value, resource.BinarySI),
+		},
+		Requests: v1.ResourceList{
+			v1.ResourceMemory: *resource.NewQuantity(memory_value, resource.BinarySI),
+		},
+	}
+
+	if err := CheckPodMemory(name, test_resource, PodMinimumMemory); err != nil {
+		t.Errorf("Error case 2: %s", err.Error())
+	}
+
+	// Only memory requested
+	test_resource = v1.ResourceRequirements{
+		Requests: v1.ResourceList{
+			v1.ResourceMemory: *resource.NewQuantity(memory_value, resource.BinarySI),
+		},
+	}
+
+	if err := CheckPodMemory(name, test_resource, PodMinimumMemory); err != nil {
+		t.Errorf("Error case 3: %s", err.Error())
+	}
+}
+
+func TestBuildAdminSocketCommand(t *testing.T) {
+	c := getDaemonConfig(config.OsdType, "")
+
+	command := c.buildAdminSocketCommand()
+	assert.Equal(t, "status", command)
+
+	c.daemonType = config.MonType
+	command = c.buildAdminSocketCommand()
+	assert.Equal(t, "mon_status", command)
+}
+
+func TestBuildSocketName(t *testing.T) {
+	daemonID := "0"
+	c := getDaemonConfig(config.OsdType, daemonID)
+
+	socketName := c.buildSocketName()
+	assert.Equal(t, "ceph-osd.0.asok", socketName)
+
+	c.daemonType = config.MonType
+	c.daemonID = "a"
+	socketName = c.buildSocketName()
+	assert.Equal(t, "ceph-mon.a.asok", socketName)
+}
+
+func TestBuildSocketPath(t *testing.T) {
+	daemonID := "0"
+	c := getDaemonConfig(config.OsdType, daemonID)
+
+	socketPath := c.buildSocketPath()
+	assert.Equal(t, "/run/ceph/ceph-osd.0.asok", socketPath)
+}
+
+func TestGenerateLivenessProbeExecDaemon(t *testing.T) {
+	daemonID := "0"
+	probe := GenerateLivenessProbeExecDaemon(config.OsdType, daemonID)
+	expectedCommand := []string{
+		"env",
+		"-i",
+		"sh",
+		"-c",
+		fmt.Sprintf(osdLivenessProbeScript, "/run/ceph/ceph-osd.0.asok", "status"),
+	}
+
+	assert.Equal(t, expectedCommand, probe.ProbeHandler.Exec.Command)
+	assert.Equal(t, livenessProbeInitialDelaySeconds, probe.InitialDelaySeconds)
+	assert.Equal(t, livenessProbeTimeoutSeconds, probe.TimeoutSeconds)
+
+	// test with a mon so the delay should be 10
+	probe = GenerateLivenessProbeExecDaemon(config.MonType, "a")
+	assert.Equal(t, livenessProbeInitialDelaySeconds, probe.InitialDelaySeconds)
+	assert.Equal(t, livenessProbeTimeoutSeconds, probe.TimeoutSeconds)
+}
+
+func TestDaemonFlags(t *testing.T) {
+	testcases := []struct {
+		label       string
+		clusterInfo *cephclient.ClusterInfo
+		clusterSpec *cephv1.ClusterSpec
+		daemonID    string
+		expected    []string
+	}{
+		{
+			label: "case 1: IPv6 enabled",
+			clusterInfo: &cephclient.ClusterInfo{
+				FSID: "id",
+			},
+			clusterSpec: &cephv1.ClusterSpec{
+				Network: cephv1.NetworkSpec{
+					IPFamily: "IPv6",
+				},
+			},
+			daemonID: "daemon-id",
+			expected: []string{
+				"--fsid=id", "--keyring=/etc/ceph/keyring-store/keyring", "--default-log-to-stderr=true", "--default-err-to-stderr=true",
+				"--default-mon-cluster-log-to-stderr=true", "--default-log-stderr-prefix=debug ", "--default-log-to-file=false", "--default-mon-cluster-log-to-file=false",
+				"--mon-host=$(ROOK_CEPH_MON_HOST)", "--mon-initial-members=$(ROOK_CEPH_MON_INITIAL_MEMBERS)", "--id=daemon-id", "--setuser=ceph", "--setgroup=ceph",
+				"--ms-bind-ipv4=false", "--ms-bind-ipv6=true",
+			},
+		},
+		{
+			label: "case 2: IPv6 disabled",
+			clusterInfo: &cephclient.ClusterInfo{
+				FSID: "id",
+			},
+			clusterSpec: &cephv1.ClusterSpec{},
+			daemonID:    "daemon-id",
+			expected: []string{
+				"--fsid=id", "--keyring=/etc/ceph/keyring-store/keyring", "--default-log-to-stderr=true", "--default-err-to-stderr=true",
+				"--default-mon-cluster-log-to-stderr=true", "--default-log-stderr-prefix=debug ", "--default-log-to-file=false", "--default-mon-cluster-log-to-file=false",
+				"--mon-host=$(ROOK_CEPH_MON_HOST)", "--mon-initial-members=$(ROOK_CEPH_MON_INITIAL_MEMBERS)", "--id=daemon-id", "--setuser=ceph", "--setgroup=ceph",
+			},
+		},
+	}
+
+	for _, tc := range testcases {
+		actual := DaemonFlags(tc.clusterInfo, tc.clusterSpec, tc.daemonID)
+		assert.Equalf(t, tc.expected, actual, "[%s]: failed to get correct daemonset flags", tc.label)
+	}
+}
+
+func TestNetworkBindingFlags(t *testing.T) {
+	ipv4FlagTrue := "--ms-bind-ipv4=true"
+	ipv4FlagFalse := "--ms-bind-ipv4=false"
+	ipv6FlagTrue := "--ms-bind-ipv6=true"
+	ipv6FlagFalse := "--ms-bind-ipv6=false"
+	type args struct {
+		cluster *cephclient.ClusterInfo
+		spec    *cephv1.ClusterSpec
+	}
+	tests := []struct {
+		name string
+		args args
+		want []string
+	}{
+		{"ipv4", args{cluster: &cephclient.ClusterInfo{CephVersion: version.Squid}, spec: &cephv1.ClusterSpec{Network: cephv1.NetworkSpec{IPFamily: cephv1.IPv4}}}, []string{ipv4FlagTrue, ipv6FlagFalse}},
+		{"ipv6", args{cluster: &cephclient.ClusterInfo{CephVersion: version.Squid}, spec: &cephv1.ClusterSpec{Network: cephv1.NetworkSpec{IPFamily: cephv1.IPv6}}}, []string{ipv4FlagFalse, ipv6FlagTrue}},
+		{"dualstack-supported", args{cluster: &cephclient.ClusterInfo{CephVersion: version.Squid}, spec: &cephv1.ClusterSpec{Network: cephv1.NetworkSpec{IPFamily: cephv1.IPv6, DualStack: true}}}, []string{ipv4FlagTrue, ipv6FlagTrue}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := NetworkBindingFlags(tt.args.cluster, tt.args.spec); !reflect.DeepEqual(got, tt.want) {
+				if len(got) != 0 && len(tt.want) != 0 {
+					t.Errorf("NetworkBindingFlags() = %+v, want %+v", got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestMsgr1BindingFlags(t *testing.T) {
+	requireMsgr2 := &cephv1.ClusterSpec{Network: cephv1.NetworkSpec{Connections: &cephv1.ConnectionsSpec{RequireMsgr2: true}}}
+	encryption := &cephv1.ClusterSpec{Network: cephv1.NetworkSpec{Connections: &cephv1.ConnectionsSpec{Encryption: &cephv1.EncryptionSpec{Enabled: true}}}}
+	compression := &cephv1.ClusterSpec{Network: cephv1.NetworkSpec{Connections: &cephv1.ConnectionsSpec{Compression: &cephv1.CompressionSpec{Enabled: true}}}}
+	msgr2Only := map[string]*cephclient.MonInfo{
+		"a": cephclient.NewMonInfo("a", "10.0.0.1", 3300),
+		"b": cephclient.NewMonInfo("b", "10.0.0.2", 3300),
+	}
+	oneMsgr1 := map[string]*cephclient.MonInfo{
+		"a": cephclient.NewMonInfo("a", "10.0.0.1", 3300),
+		"b": cephclient.NewMonInfo("b", "10.0.0.2", 6789),
+	}
+	disable := []string{"--ms-bind-msgr1=false"}
+
+	tests := []struct {
+		name         string
+		spec         *cephv1.ClusterSpec
+		internalMons map[string]*cephclient.MonInfo
+		externalMons map[string]*cephclient.MonInfo
+		want         []string
+	}{
+		{"msgr2 not required", &cephv1.ClusterSpec{}, msgr2Only, nil, []string{}},
+		{"requireMsgr2 with all mons on v2", requireMsgr2, msgr2Only, nil, disable},
+		{"encryption with all mons on v2", encryption, msgr2Only, nil, disable},
+		{"compression with all mons on v2", compression, msgr2Only, nil, disable},
+		{"a mon still advertises v1", requireMsgr2, oneMsgr1, nil, []string{}},
+		{"an external mon is recorded on the v2 port", requireMsgr2, msgr2Only, map[string]*cephclient.MonInfo{"c": cephclient.NewMonInfo("c", "10.0.0.3", 3300)}, []string{}},
+		{"external cluster", &cephv1.ClusterSpec{External: cephv1.ExternalSpec{Enable: true}, Network: requireMsgr2.Network}, msgr2Only, nil, []string{}},
+		{"no mons known", requireMsgr2, map[string]*cephclient.MonInfo{}, nil, []string{}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cluster := &cephclient.ClusterInfo{InternalMonitors: tt.internalMons, ExternalMons: tt.externalMons}
+			assert.Equal(t, tt.want, Msgr1BindingFlags(cluster, tt.spec))
+		})
+	}
+}
+
+func TestExtractMgrIP(t *testing.T) {
+	activeMgrRaw := "172.17.0.12:6801/2535462469"
+	ip := extractMgrIP(activeMgrRaw)
+	assert.Equal(t, "172.17.0.12", ip)
+
+	activeMgrRaw = "[2001:db8::1]:6801/2535462469"
+	ip = extractMgrIP(activeMgrRaw)
+	assert.Equal(t, "2001:db8::1", ip)
+
+	activeMgrRaw = "invalid-address"
+	ip = extractMgrIP(activeMgrRaw)
+	assert.Equal(t, activeMgrRaw, ip)
+
+	activeMgrRaw = ""
+	ip = extractMgrIP(activeMgrRaw)
+	assert.Equal(t, "", ip)
+
+	activeMgrRaw = "172.17.0.12"
+	ip = extractMgrIP(activeMgrRaw)
+	assert.Equal(t, activeMgrRaw, ip)
+}
+
+func TestConfigureExternalMetricsEndpoint(t *testing.T) {
+	clusterInfo := cephclient.AdminTestClusterInfo("rook-ceph")
+	t.Run("spec and current active mgr endpoint identical with no existing endpoint object", func(t *testing.T) {
+		monitoringSpec := cephv1.MonitoringSpec{
+			Enabled:              true,
+			ExternalMgrEndpoints: []v1.EndpointAddress{{IP: "192.168.0.1"}},
+		}
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				logger.Infof("Command: %s %v", command, args)
+				if args[1] == "dump" {
+					return fmt.Sprintf(`{"active_addr":"%s"}`, "192.168.0.1:6801/2535462469"), nil
+				}
+				return "", errors.New("unknown command")
+			},
+		}
+
+		ctx := &clusterd.Context{
+			Clientset:     test.New(t, 3),
+			RookClientset: rookclient.NewSimpleClientset(),
+			Executor:      executor,
+		}
+
+		err := ConfigureExternalMetricsEndpoint(ctx, monitoringSpec, clusterInfo, cephclient.NewMinimumOwnerInfo(t))
+		assert.NoError(t, err)
+
+		currentEndpoints, err := ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(t.Context(), "rook-ceph-mgr-external", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, "192.168.0.1", currentEndpoints.Endpoints[0].Addresses[0], currentEndpoints)
+	})
+
+	t.Run("spec and current active mgr endpoint different with no existing endpoint object", func(t *testing.T) {
+		monitoringSpec := cephv1.MonitoringSpec{
+			Enabled:              true,
+			ExternalMgrEndpoints: []v1.EndpointAddress{{IP: "192.168.0.1"}},
+		}
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				logger.Infof("Command: %s %v", command, args)
+				if args[1] == "dump" {
+					return fmt.Sprintf(`{"active_addr":"%s"}`, "172.17.0.12:6801/2535462469"), nil
+				}
+				return "", errors.New("unknown command")
+			},
+		}
+		ctx := &clusterd.Context{
+			Clientset:     test.New(t, 3),
+			RookClientset: rookclient.NewSimpleClientset(),
+			Executor:      executor,
+		}
+
+		err := ConfigureExternalMetricsEndpoint(ctx, monitoringSpec, clusterInfo, cephclient.NewMinimumOwnerInfo(t))
+		assert.NoError(t, err)
+
+		currentEndpoints, err := ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(t.Context(), "rook-ceph-mgr-external", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, "172.17.0.12", currentEndpoints.Endpoints[0].Addresses[0], currentEndpoints)
+	})
+
+	t.Run("spec and current active mgr endpoint different with existing endpoint object", func(t *testing.T) {
+		monitoringSpec := cephv1.MonitoringSpec{
+			Enabled:              true,
+			ExternalMgrEndpoints: []v1.EndpointAddress{{IP: "192.168.0.1"}},
+		}
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				logger.Infof("Command: %s %v", command, args)
+				if args[1] == "dump" {
+					return fmt.Sprintf(`{"active_addr":"%s"}`, "172.17.0.12:6801/2535462469"), nil
+				}
+				return "", errors.New("unknown command")
+			},
+		}
+		ctx := &clusterd.Context{
+			Clientset:     test.New(t, 3),
+			RookClientset: rookclient.NewSimpleClientset(),
+			Executor:      executor,
+		}
+		ownerInfo := cephclient.NewMinimumOwnerInfo(t)
+		ep, err := createExternalMetricsEndpoints(clusterInfo.Namespace, monitoringSpec, ownerInfo)
+		assert.NoError(t, err)
+		_, err = ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Create(t.Context(), ep, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = ConfigureExternalMetricsEndpoint(ctx, monitoringSpec, clusterInfo, ownerInfo)
+		assert.NoError(t, err)
+
+		currentEndpoints, err := ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(t.Context(), "rook-ceph-mgr-external", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, "172.17.0.12", currentEndpoints.Endpoints[0].Addresses[0], currentEndpoints)
+		assert.Equal(t, currentEndpoints.Labels[discoveryv1.LabelServiceName], ExternalMgrAppName)
+		assert.Equal(t, currentEndpoints.Labels[k8sutil.AppAttr], "rook-ceph-mgr")
+		assert.Equal(t, currentEndpoints.Labels[k8sutil.ClusterAttr], namespace)
+	})
+
+	t.Run("spec and current active mgr endpoint identical with existing endpoint object", func(t *testing.T) {
+		monitoringSpec := cephv1.MonitoringSpec{
+			Enabled:              true,
+			ExternalMgrEndpoints: []v1.EndpointAddress{{IP: "192.168.0.1"}},
+		}
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				logger.Infof("Command: %s %v", command, args)
+				if args[1] == "dump" {
+					return fmt.Sprintf(`{"active_addr":"%s"}`, "192.168.0.1:6801/2535462469"), nil
+				}
+				return "", errors.New("unknown command")
+			},
+		}
+		ctx := &clusterd.Context{
+			Clientset:     test.New(t, 3),
+			RookClientset: rookclient.NewSimpleClientset(),
+			Executor:      executor,
+		}
+		ownerInfo := cephclient.NewMinimumOwnerInfo(t)
+		ep, err := createExternalMetricsEndpoints(clusterInfo.Namespace, monitoringSpec, ownerInfo)
+		assert.NoError(t, err)
+		_, err = ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Create(t.Context(), ep, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		err = ConfigureExternalMetricsEndpoint(ctx, monitoringSpec, clusterInfo, ownerInfo)
+		assert.NoError(t, err)
+
+		currentEndpoints, err := ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(t.Context(), "rook-ceph-mgr-external", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Equal(t, "192.168.0.1", currentEndpoints.Endpoints[0].Addresses[0], currentEndpoints)
+	})
+
+	t.Run("active mgr at non-zero position should deduplicate without losing other endpoints", func(t *testing.T) {
+		monitoringSpec := cephv1.MonitoringSpec{
+			Enabled: true,
+			ExternalMgrEndpoints: []v1.EndpointAddress{
+				{IP: "192.168.0.1"}, // [0] stale
+				{IP: "192.168.0.2"}, // [1] active mgr
+				{IP: "192.168.0.3"}, // [2] standby
+			},
+		}
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if args[1] == "dump" {
+					return fmt.Sprintf(`{"active_addr":"%s"}`, "192.168.0.2:6801/2535462469"), nil
+				}
+				return "", errors.New("unknown command")
+			},
+		}
+		ctx := &clusterd.Context{
+			Clientset:     test.New(t, 3),
+			RookClientset: rookclient.NewSimpleClientset(),
+			Executor:      executor,
+		}
+
+		err := ConfigureExternalMetricsEndpoint(ctx, monitoringSpec, clusterInfo, cephclient.NewMinimumOwnerInfo(t))
+		assert.NoError(t, err)
+
+		currentEndpoints, err := ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(t.Context(), "rook-ceph-mgr-external", metav1.GetOptions{})
+		assert.NoError(t, err)
+		// Active mgr at [0], stale [0] preserved, no duplicates
+		assert.Equal(t, []string{"192.168.0.2", "192.168.0.1", "192.168.0.3"}, currentEndpoints.Endpoints[0].Addresses)
+	})
+
+	t.Run("mgr map failure should not overwrite endpoints", func(t *testing.T) {
+		monitoringSpec := cephv1.MonitoringSpec{
+			Enabled: true,
+			ExternalMgrEndpoints: []v1.EndpointAddress{
+				{IP: "192.168.0.1"},
+				{IP: "192.168.0.2"},
+			},
+		}
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if args[1] == "dump" {
+					return "", errors.New("failed to get mgr map")
+				}
+				return "", errors.New("unknown command")
+			},
+		}
+		ctx := &clusterd.Context{
+			Clientset:     test.New(t, 3),
+			RookClientset: rookclient.NewSimpleClientset(),
+			Executor:      executor,
+		}
+
+		err := ConfigureExternalMetricsEndpoint(ctx, monitoringSpec, clusterInfo, cephclient.NewMinimumOwnerInfo(t))
+		assert.NoError(t, err)
+
+		currentEndpoints, err := ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(t.Context(), "rook-ceph-mgr-external", metav1.GetOptions{})
+		assert.NoError(t, err)
+		// Endpoints unchanged when active mgr cannot be determined
+		assert.Equal(t, []string{"192.168.0.1", "192.168.0.2"}, currentEndpoints.Endpoints[0].Addresses)
+	})
+
+	t.Run("pre-existing duplicates should be collapsed", func(t *testing.T) {
+		monitoringSpec := cephv1.MonitoringSpec{
+			Enabled: true,
+			ExternalMgrEndpoints: []v1.EndpointAddress{
+				{IP: "192.168.0.1"}, // [0] active mgr
+				{IP: "192.168.0.1"}, // [1] duplicate
+				{IP: "192.168.0.2"}, // [2] standby
+			},
+		}
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if args[1] == "dump" {
+					return fmt.Sprintf(`{"active_addr":"%s"}`, "192.168.0.1:6801/2535462469"), nil
+				}
+				return "", errors.New("unknown command")
+			},
+		}
+		ctx := &clusterd.Context{
+			Clientset:     test.New(t, 3),
+			RookClientset: rookclient.NewSimpleClientset(),
+			Executor:      executor,
+		}
+
+		err := ConfigureExternalMetricsEndpoint(ctx, monitoringSpec, clusterInfo, cephclient.NewMinimumOwnerInfo(t))
+		assert.NoError(t, err)
+
+		currentEndpoints, err := ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(t.Context(), "rook-ceph-mgr-external", metav1.GetOptions{})
+		assert.NoError(t, err)
+		// Active mgr at [0], duplicate removed
+		assert.Equal(t, []string{"192.168.0.1", "192.168.0.2"}, currentEndpoints.Endpoints[0].Addresses)
+	})
+
+	t.Run("active mgr already at [0] with multi-element list should preserve order minus duplicates", func(t *testing.T) {
+		monitoringSpec := cephv1.MonitoringSpec{
+			Enabled: true,
+			ExternalMgrEndpoints: []v1.EndpointAddress{
+				{IP: "192.168.0.1"}, // [0] active mgr
+				{IP: "192.168.0.2"}, // [1] standby 1
+				{IP: "192.168.0.3"}, // [2] standby 2
+			},
+		}
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if args[1] == "dump" {
+					return fmt.Sprintf(`{"active_addr":"%s"}`, "192.168.0.1:6801/2535462469"), nil
+				}
+				return "", errors.New("unknown command")
+			},
+		}
+		ctx := &clusterd.Context{
+			Clientset:     test.New(t, 3),
+			RookClientset: rookclient.NewSimpleClientset(),
+			Executor:      executor,
+		}
+
+		err := ConfigureExternalMetricsEndpoint(ctx, monitoringSpec, clusterInfo, cephclient.NewMinimumOwnerInfo(t))
+		assert.NoError(t, err)
+
+		currentEndpoints, err := ctx.Clientset.DiscoveryV1().EndpointSlices(namespace).Get(t.Context(), "rook-ceph-mgr-external", metav1.GetOptions{})
+		assert.NoError(t, err)
+		// Active mgr stays at [0], remaining order preserved
+		assert.Equal(t, []string{"192.168.0.1", "192.168.0.2", "192.168.0.3"}, currentEndpoints.Endpoints[0].Addresses)
+	})
+}
+
+func TestLogCollectorContainer(t *testing.T) {
+	daemonId := "ceph-mon-a"
+	ns := "rook-ceph"
+
+	t.Run("Periodicity 1d and no MaxlogSize", func(t *testing.T) {
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, Periodicity: "1d"}}
+		got := LogCollectorContainer(daemonId, ns, c, nil)
+		want := fmt.Sprintf(cronLogRotate, daemonId, "daily", "0", "7", "")
+		assert.Equal(t, want, got.Command[5])
+	})
+
+	t.Run("Periodicity 1h and MaxlogSize 1M", func(t *testing.T) {
+		maxsize, _ := resource.ParseQuantity("1M")
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, Periodicity: "1h", MaxLogSize: &maxsize}}
+		got := LogCollectorContainer("ceph-client.rbd-mirror.a", ns, c, nil)
+		want := fmt.Sprintf(cronLogRotate, "ceph-client.rbd-mirror.a", "hourly", "1M", "28", "")
+		assert.Equal(t, want, got.Command[5])
+	})
+
+	t.Run("Periodicity weekly and 1G MaxlogSize", func(t *testing.T) {
+		maxsize, _ := resource.ParseQuantity("1Gi")
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, Periodicity: "weekly", MaxLogSize: &maxsize}}
+		got := LogCollectorContainer(daemonId, ns, c, nil)
+		want := fmt.Sprintf(cronLogRotate, daemonId, "weekly", "1073M", "7", "")
+		assert.Equal(t, want, got.Command[5])
+	})
+
+	t.Run("MaxlogSize 1M and no Periodicity", func(t *testing.T) {
+		maxsize, _ := resource.ParseQuantity("1Mi")
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, MaxLogSize: &maxsize}}
+		got := LogCollectorContainer(daemonId, ns, c, nil)
+		want := fmt.Sprintf(cronLogRotate, daemonId, "daily", "1M", "7", "")
+		assert.Equal(t, want, got.Command[5])
+	})
+
+	t.Run("10G MaxlogSize and Periodicity 1d", func(t *testing.T) {
+		maxsize, _ := resource.ParseQuantity("10G")
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, Periodicity: "1d", MaxLogSize: &maxsize}}
+		got := LogCollectorContainer(daemonId, ns, c, nil)
+		want := fmt.Sprintf(cronLogRotate, daemonId, "daily", "10G", "7", "")
+		assert.Equal(t, want, got.Command[5])
+	})
+
+	t.Run("10M MaxlogSize and Periodicity weekly", func(t *testing.T) {
+		maxsize, _ := resource.ParseQuantity("10Mi")
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, Periodicity: "weekly", MaxLogSize: &maxsize}}
+		got := LogCollectorContainer(daemonId, ns, c, nil)
+		want := fmt.Sprintf(cronLogRotate, daemonId, "weekly", "10M", "7", "")
+		assert.Equal(t, want, got.Command[5])
+	})
+
+	t.Run("1M MaxlogSize and Periodicity 1d", func(t *testing.T) {
+		maxsize, _ := resource.ParseQuantity("1M")
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, Periodicity: "1d", MaxLogSize: &maxsize}}
+		got := LogCollectorContainer(daemonId, ns, c, nil)
+		want := fmt.Sprintf(cronLogRotate, daemonId, "daily", "1M", "7", "")
+		assert.Equal(t, want, got.Command[5])
+	})
+
+	t.Run("500k MaxlogSize and Periodicity 1d", func(t *testing.T) {
+		maxsize, _ := resource.ParseQuantity("500K")
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, Periodicity: "1d", MaxLogSize: &maxsize}}
+		got := LogCollectorContainer(daemonId, ns, c, nil)
+		want := fmt.Sprintf(cronLogRotate, daemonId, "daily", "1M", "7", "")
+		assert.Equal(t, want, got.Command[5])
+	})
+
+	t.Run("AdditionalLogFile, 500k MaxlogSize and Periodicity 1d", func(t *testing.T) {
+		additionalLogFile := "/tmp/ceph_test_log_500KB.log"
+		maxsize, _ := resource.ParseQuantity("500K")
+		c := cephv1.ClusterSpec{LogCollector: cephv1.LogCollectorSpec{Enabled: true, Periodicity: "1d", MaxLogSize: &maxsize}}
+		got := LogCollectorContainer(daemonId, ns, c, nil, additionalLogFile)
+
+		want := fmt.Sprintf(cronLogRotate, daemonId, "daily", "1M", "7", additionalLogFile)
+		assert.Equal(t, want, got.Command[5])
+	})
+}
+
+func TestGetContainerImagePullPolicy(t *testing.T) {
+	t.Run("containerImagePullPolicy is set in cluster CR", func(t *testing.T) {
+		containerImagePullPolicy := v1.PullAlways
+
+		imagePullPolicy := GetContainerImagePullPolicy(containerImagePullPolicy)
+		assert.Equal(t, containerImagePullPolicy, imagePullPolicy)
+	})
+
+	t.Run("containerImagePullPolicy is empty", func(t *testing.T) {
+		exepctedImagePullPolicy := v1.PullIfNotPresent
+		imagePullPolicy := GetContainerImagePullPolicy(v1.PullPolicy(""))
+		assert.Equal(t, exepctedImagePullPolicy, imagePullPolicy)
+	})
+}
+
+func TestDaemonEnvVars(t *testing.T) {
+	// No network settings specified
+	want := []v1.EnvVar{}
+
+	clusterSpec := &cephv1.ClusterSpec{}
+	got := ApplyNetworkEnv(clusterSpec)
+	assert.Equal(t, want, got)
+
+	// When Encryption is enabled
+	connections := &cephv1.ConnectionsSpec{
+		Encryption: &cephv1.EncryptionSpec{Enabled: true},
+	}
+
+	clusterSpec.Network = cephv1.NetworkSpec{Connections: connections}
+
+	want = []v1.EnvVar{{
+		Name:  "ROOK_MSGR2",
+		Value: "msgr2_false_encryption_true_compression_false",
+	}}
+
+	got = ApplyNetworkEnv(clusterSpec)
+	assert.Equal(t, want, got)
+
+	// When Compression is enabled
+	connections = &cephv1.ConnectionsSpec{
+		Compression: &cephv1.CompressionSpec{
+			Enabled: true,
+		},
+	}
+	clusterSpec.Network = cephv1.NetworkSpec{Connections: connections}
+
+	want = []v1.EnvVar{{
+		Name:  "ROOK_MSGR2",
+		Value: "msgr2_false_encryption_false_compression_true",
+	}}
+
+	got = ApplyNetworkEnv(clusterSpec)
+	assert.Equal(t, want, got)
+
+	// When Msgr2 is enabled
+	connections = &cephv1.ConnectionsSpec{
+		RequireMsgr2: true,
+	}
+	clusterSpec.Network = cephv1.NetworkSpec{Connections: connections}
+
+	want = []v1.EnvVar{{
+		Name:  "ROOK_MSGR2",
+		Value: "msgr2_true_encryption_false_compression_false",
+	}}
+
+	got = ApplyNetworkEnv(clusterSpec)
+	assert.Equal(t, want, got)
+
+	// When Msgr2, Compression, Encryption are enabled
+	connections = &cephv1.ConnectionsSpec{
+		RequireMsgr2: true,
+		Encryption: &cephv1.EncryptionSpec{
+			Enabled: true,
+		},
+		Compression: &cephv1.CompressionSpec{
+			Enabled: true,
+		},
+	}
+	clusterSpec.Network = cephv1.NetworkSpec{Connections: connections}
+
+	want = []v1.EnvVar{{
+		Name:  "ROOK_MSGR2",
+		Value: "msgr2_true_encryption_true_compression_true",
+	}}
+
+	got = ApplyNetworkEnv(clusterSpec)
+	assert.Equal(t, want, got)
+
+	// When Msgr2 is enabled but Compression, Encryption are disabled
+	connections = &cephv1.ConnectionsSpec{
+		RequireMsgr2: true,
+		Encryption: &cephv1.EncryptionSpec{
+			Enabled: false,
+		},
+		Compression: &cephv1.CompressionSpec{
+			Enabled: false,
+		},
+	}
+	clusterSpec.Network = cephv1.NetworkSpec{Connections: connections}
+
+	want = []v1.EnvVar{{
+		Name:  "ROOK_MSGR2",
+		Value: "msgr2_true_encryption_false_compression_false",
+	}}
+
+	got = ApplyNetworkEnv(clusterSpec)
+	assert.Equal(t, want, got)
+}
+
+func TestGetDaemonsToSkipReconcile(t *testing.T) {
+	tests := []struct {
+		name             string
+		labels           map[string]string
+		expectedSkip     bool
+		expectedDaemonID string
+	}{
+		{
+			name: "has skip-reconcile label",
+			labels: map[string]string{
+				k8sutil.AppAttr:              "rook-ceph-nfs",
+				cephv1.SkipReconcileLabelKey: "true",
+				config.NfsType:               "a",
+			},
+			expectedSkip:     true,
+			expectedDaemonID: "a",
+		},
+		{
+			name: "no skip-reconcile label",
+			labels: map[string]string{
+				k8sutil.AppAttr: "rook-ceph-nfs",
+				config.NfsType:  "b",
+			},
+			expectedSkip:     false,
+			expectedDaemonID: "b",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			namespace := "rook-ceph"
+			daemonName := "nfs"
+			appLabel := "rook-ceph-nfs"
+
+			clientset := test.New(t, 1)
+
+			dep := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("%s-%s-%s", appLabel, daemonName, tt.expectedDaemonID),
+					Namespace: namespace,
+					Labels:    tt.labels,
+				},
+			}
+
+			_, err := clientset.AppsV1().Deployments(namespace).Create(t.Context(), dep, metav1.CreateOptions{})
+			assert.NoError(t, err)
+
+			clusterdCtx := &clusterd.Context{
+				Clientset: clientset,
+			}
+
+			result, err := GetDaemonsToSkipReconcile(t.Context(), clusterdCtx, namespace, daemonName, appLabel)
+			assert.NoError(t, err)
+
+			if tt.expectedSkip {
+				assert.Len(t, result, 1)
+				assert.True(t, result.Has(tt.expectedDaemonID), "expected daemon ID %q to be skipped", tt.expectedDaemonID)
+			} else {
+				assert.Len(t, result, 0)
+				assert.False(t, result.Has(tt.expectedDaemonID), "expected daemon ID %q NOT to be skipped", tt.expectedDaemonID)
+			}
+		})
+	}
+}
+
+func TestGenerateMinimalCephConfInitContainer(t *testing.T) {
+	const clientID = "client.nfs-ganesha.my-nfs.a"
+	const keyringPath = "/etc/ceph/keyring-store/keyring"
+	const monHost = "[v2:127.0.0.1:3300]"
+
+	for _, tt := range []struct {
+		name            string
+		overrides       string
+		missingOverride bool
+	}{
+		{
+			name: "empty overrides",
+		},
+		{
+			name:      "preserve RDMA settings without trailing newline",
+			overrides: "[global]\nms_public_type = async+rdma\nms_async_rdma_device_name = mlx5_bond_0\nms_async_rdma_gid_idx = 7\nms_async_rdma_roce_ver = 2",
+		},
+		{
+			name:      "generated values override stale client settings",
+			overrides: "[global]\nmon_host = stale-host\n[" + clientID + "]\nkeyring = stale-keyring",
+		},
+		{
+			name:      "generated values override stale global settings",
+			overrides: "[global]\nmon_host = stale-host\nkeyring = stale-keyring\n",
+		},
+		{
+			name:      "preserve literal shell content",
+			overrides: "[global]\nlog_file = $(touch injected) `touch injected` $HOME",
+		},
+		{
+			name:            "missing override file",
+			missingOverride: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			container := GenerateMinimalCephConfInitContainer(clientID, keyringPath, "ceph", v1.PullIfNotPresent,
+				[]v1.VolumeMount{{Name: "generated-config", MountPath: "/etc/ceph"}}, v1.ResourceRequirements{}, nil)
+			require.Len(t, container.VolumeMounts, 2)
+			overrideMount := container.VolumeMounts[1]
+			assert.Equal(t, k8sutil.ConfigOverrideName, overrideMount.Name)
+			assert.True(t, overrideMount.ReadOnly)
+			assert.NotEqual(t, "/etc/ceph", overrideMount.MountPath)
+
+			dir := t.TempDir()
+			overrideDir := filepath.Join(dir, "overrides")
+			require.NoError(t, os.Mkdir(overrideDir, 0o700))
+			if !tt.missingOverride {
+				require.NoError(t, os.WriteFile(filepath.Join(overrideDir, "ceph.conf"), []byte(tt.overrides), 0o600))
+			}
+			cfgPath := filepath.Join(dir, "ceph.conf")
+			script := strings.ReplaceAll(container.Command[2], cephclient.DefaultConfigFilePath(), cfgPath)
+			script = strings.ReplaceAll(script, overrideMount.MountPath, overrideDir)
+			// Kubernetes expands this reference before starting the container.
+			script = strings.ReplaceAll(script, "$(ROOK_CEPH_MON_HOST)", monHost)
+			cmd := exec.Command("bash", "-c", script)
+			cmd.Dir = dir
+			out, err := cmd.CombinedOutput()
+			require.NoError(t, err, string(out))
+
+			cfg, err := ini.Load(cfgPath)
+			require.NoError(t, err)
+			assert.Equal(t, monHost, cfg.Section("global").Key("mon_host").String())
+			assert.Equal(t, keyringPath, cfg.Section(clientID).Key("keyring").String())
+			if strings.Contains(tt.overrides, "async+rdma") {
+				assert.Equal(t, "async+rdma", cfg.Section("global").Key("ms_public_type").String())
+				assert.Equal(t, "mlx5_bond_0", cfg.Section("global").Key("ms_async_rdma_device_name").String())
+				assert.Equal(t, "7", cfg.Section("global").Key("ms_async_rdma_gid_idx").String())
+				assert.Equal(t, "2", cfg.Section("global").Key("ms_async_rdma_roce_ver").String())
+			}
+			if strings.Contains(tt.overrides, "log_file") {
+				assert.Equal(t, "$(touch injected) `touch injected` $HOME", cfg.Section("global").Key("log_file").String())
+			}
+			info, err := os.Stat(cfgPath)
+			require.NoError(t, err)
+			assert.Equal(t, os.FileMode(0o444), info.Mode().Perm())
+			_, err = os.Stat(filepath.Join(dir, "injected"))
+			assert.True(t, os.IsNotExist(err), "override contents must not be evaluated by the shell")
+		})
+	}
+}

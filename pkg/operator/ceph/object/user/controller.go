@@ -1,0 +1,1258 @@
+/*
+Copyright 2018 The Rook Authors. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package objectuser to manage a rook object store user.
+package objectuser
+
+import (
+	"context"
+	"fmt"
+	"maps"
+	"reflect"
+	"regexp"
+	"slices"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/ceph/go-ceph/rgw/admin"
+	"github.com/coreos/pkg/capnslog"
+	"github.com/pkg/errors"
+	corev1 "k8s.io/api/core/v1"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	apimachineryvalidation "k8s.io/apimachinery/pkg/api/validation"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/validation/field"
+	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/source"
+
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/clusterd"
+	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/object"
+	opmask "github.com/rook/rook/pkg/operator/ceph/object/user/opmask"
+	"github.com/rook/rook/pkg/operator/ceph/reporting"
+	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util/log"
+)
+
+const (
+	appName        = object.AppName
+	controllerName = "ceph-object-store-user-controller"
+)
+
+// iamDisplayNamePattern is the pattern that must match for account users.
+// Account users are referenced by display name in IAM policy ARNs, so the name must be IAM-compatible.
+var iamDisplayNamePattern = regexp.MustCompile(`^[\w+=,.@-]+$`)
+
+var (
+	userInfoWithoutKeysMinCephVersion = cephver.CephVersion{Major: 19, Minor: 2, Extra: 0}
+	accountsMinCephVersion            = cephver.CephVersion{Major: 19, Minor: 2, Extra: 3}
+)
+
+// newMultisiteAdminOpsCtxFunc helps us mock the admin ops API client in unit tests
+var newMultisiteAdminOpsCtxFunc = object.NewMultisiteAdminOpsContext
+
+var logger = capnslog.NewPackageLogger("github.com/rook/rook", "object-user-controller")
+
+// Sets the type meta for the controller main object
+var controllerTypeMeta = metav1.TypeMeta{
+	Kind:       reflect.TypeFor[cephv1.CephObjectStoreUser]().Name(),
+	APIVersion: fmt.Sprintf("%s/%s", cephv1.CustomResourceGroup, cephv1.Version),
+}
+
+// ReconcileObjectStoreUser reconciles an ObjectStoreUser object
+type ReconcileObjectStoreUser struct {
+	client            client.Client
+	scheme            *runtime.Scheme
+	context           *clusterd.Context
+	objContext        *object.AdminOpsContext
+	advertiseEndpoint string
+	cephClusterSpec   *cephv1.ClusterSpec
+	clusterInfo       *cephclient.ClusterInfo
+	opManagerContext  context.Context
+	recorder          events.EventRecorder
+}
+
+// Add creates a new CephObjectStoreUser Controller and adds it to the Manager. The Manager will set fields on the Controller
+// and Start it when the Manager is Started.
+func Add(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) error {
+	return add(mgr, newReconciler(mgr, context, opManagerContext))
+}
+
+// newReconciler returns a new reconcile.Reconciler
+func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context) reconcile.Reconciler {
+	return &ReconcileObjectStoreUser{
+		client:           mgr.GetClient(),
+		scheme:           mgr.GetScheme(),
+		context:          context,
+		opManagerContext: opManagerContext,
+		recorder:         mgr.GetEventRecorder("rook-" + controllerName),
+	}
+}
+
+func add(mgr manager.Manager, r reconcile.Reconciler) error {
+	// Create a new controller
+	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: r})
+	if err != nil {
+		return err
+	}
+	logger.Info("successfully started")
+
+	// Watch for changes on the CephObjectStoreUser CRD object
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&cephv1.CephObjectStoreUser{TypeMeta: controllerTypeMeta},
+			&handler.TypedEnqueueRequestForObject[*cephv1.CephObjectStoreUser]{},
+			opcontroller.WatchControllerPredicate[*cephv1.CephObjectStoreUser](mgr.GetScheme()),
+		),
+	)
+	if err != nil {
+		return err
+	}
+
+	// Watch secrets
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&corev1.Secret{TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: corev1.SchemeGroupVersion.String()}},
+			handler.TypedEnqueueRequestForOwner[*corev1.Secret](
+				mgr.GetScheme(),
+				mgr.GetRESTMapper(),
+				&cephv1.CephObjectStoreUser{},
+			),
+			opcontroller.WatchPredicateForNonCRDObject[*corev1.Secret](&cephv1.CephObjectStoreUser{TypeMeta: controllerTypeMeta}, mgr.GetScheme()),
+		),
+	)
+	if err != nil {
+		return err
+	}
+
+	// watch secrets referenced by CephObjectStoreUser.spec.keys
+	const (
+		secretNameField = "spec.keys.secretNames"
+	)
+
+	err = mgr.GetFieldIndexer().IndexField(context.TODO(), &cephv1.CephObjectStoreUser{TypeMeta: controllerTypeMeta}, secretNameField, func(obj client.Object) []string {
+		var secretNames []string
+		for _, k := range obj.(*cephv1.CephObjectStoreUser).Spec.Keys {
+			if k.AccessKeyRef != nil && k.AccessKeyRef.Name != "" {
+				secretNames = append(secretNames, k.AccessKeyRef.Name)
+			}
+			if k.SecretKeyRef != nil && k.SecretKeyRef.Name != "" {
+				secretNames = append(secretNames, k.SecretKeyRef.Name)
+			}
+		}
+		slices.Sort(secretNames)
+		return slices.Compact(secretNames)
+	})
+	if err != nil {
+		return errors.Wrapf(err, "failed to setup IndexField for CephObjectStoreUser.Spec.Keys")
+	}
+
+	// Always trigger a reconcile when a secret is deleted. This will cause a
+	// reconciliation failure to happen immediately in hopes of alerting the end
+	// user to the configuration problem.
+	changedOrDeleted := predicate.Or(
+		predicate.TypedResourceVersionChangedPredicate[*corev1.Secret]{},
+		predicate.TypedFuncs[*corev1.Secret]{
+			DeleteFunc: func(e event.TypedDeleteEvent[*corev1.Secret]) bool {
+				return true
+			},
+		},
+	)
+
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&corev1.Secret{},
+			handler.TypedEnqueueRequestsFromMapFunc(
+				func(ctx context.Context, secret *corev1.Secret) []reconcile.Request {
+					referencingUsers := &cephv1.CephObjectStoreUserList{}
+					err := r.(*ReconcileObjectStoreUser).client.List(ctx, referencingUsers, &client.ListOptions{
+						FieldSelector: fields.OneTermEqualSelector(secretNameField, secret.GetName()),
+						Namespace:     secret.GetNamespace(),
+					})
+					if err != nil {
+						logger.Errorf("failed to list CephObjectStoreUser(s) while handling event for secret %q in namespace %q. %v", secret.GetName(), secret.GetNamespace(), err)
+						return []reconcile.Request{}
+					}
+
+					requests := make([]reconcile.Request, len(referencingUsers.Items))
+					for i, item := range referencingUsers.Items {
+						requests[i] = reconcile.Request{
+							NamespacedName: types.NamespacedName{
+								Name:      item.GetName(),
+								Namespace: item.GetNamespace(),
+							},
+						}
+					}
+					logger.Tracef("CephObjectStoreUsers referencing Secret %q in namespace %q: %v", secret.GetName(), secret.GetNamespace(), requests)
+					return requests
+				},
+			),
+			changedOrDeleted,
+		),
+	)
+	if err != nil {
+		return errors.Wrapf(err, "failed to configure watch for Secret(s)")
+	}
+
+	return nil
+}
+
+// Reconcile reads the state of the cluster for a CephObjectStoreUser object and makes changes based on the state read
+// and what is in the CephObjectStoreUser.Spec
+// The Controller will requeue the Request to be processed again if the returned error is non-nil or
+// Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
+func (r *ReconcileObjectStoreUser) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
+	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
+	reconcileResponse, cephObjectStoreUser, err := r.reconcile(request)
+	if err != nil {
+		r.updateStatus(k8sutil.ObservedGenerationNotAvailable, request.NamespacedName, k8sutil.ReconcileFailedStatus, nil)
+		log.NamedError(request.NamespacedName, logger, "failed to reconcile %v", err)
+	}
+
+	return reporting.ReportReconcileResult(logger, r.recorder, request, &cephObjectStoreUser, reconcileResponse, err)
+}
+
+func (r *ReconcileObjectStoreUser) reconcile(request reconcile.Request) (reconcile.Result, cephv1.CephObjectStoreUser, error) {
+	// Fetch the CephObjectStoreUser instance
+	cephObjectStoreUser := &cephv1.CephObjectStoreUser{}
+	err := r.client.Get(r.opManagerContext, request.NamespacedName, cephObjectStoreUser)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			log.NamedDebug(request.NamespacedName, logger, "CephObjectStoreUser resource not found. Ignoring since object must be deleted.")
+			return reconcile.Result{}, *cephObjectStoreUser, nil
+		}
+		// Error reading the object - requeue the request.
+		return reconcile.Result{}, *cephObjectStoreUser, errors.Wrap(err, "failed to get CephObjectStoreUser")
+	}
+	// update observedGeneration local variable with current generation value,
+	// because generation can be changed before reconcile got completed
+	// CR status will be updated at end of reconcile, so to reflect the reconcile has finished
+	observedGeneration := cephObjectStoreUser.ObjectMeta.Generation
+
+	// Set a finalizer so we can do cleanup before the object goes away
+	generationUpdated, err := opcontroller.AddFinalizerIfNotPresent(r.opManagerContext, r.client, cephObjectStoreUser)
+	if err != nil {
+		return reconcile.Result{}, *cephObjectStoreUser, errors.Wrap(err, "failed to add finalizer")
+	}
+	if generationUpdated {
+		log.NamedInfo(request.NamespacedName, logger, "reconciling the object user after adding finalizer")
+		return reconcile.Result{}, *cephObjectStoreUser, nil
+	}
+
+	clusterNamespace := request.NamespacedName
+	clusterNamespace.Namespace = clusterStoreNamespace(cephObjectStoreUser)
+
+	// The CR was just created, initializing status fields
+	if cephObjectStoreUser.Status == nil {
+		r.updateStatus(k8sutil.ObservedGenerationNotAvailable, request.NamespacedName, k8sutil.EmptyStatus, nil)
+	}
+
+	// Make sure a CephCluster is present otherwise do nothing
+	cephCluster, isReadyToReconcile, cephClusterExists, reconcileResponse := opcontroller.IsReadyToReconcile(r.opManagerContext, r.client, clusterNamespace, controllerName)
+	if !isReadyToReconcile {
+		// This handles the case where the Ceph Cluster is gone and we want to delete that CR
+		// We skip the deleteUser() function since everything is gone already
+		//
+		// Also, only remove the finalizer if the CephCluster is gone
+		// If not, we should wait for it to be ready
+		// This handles the case where the operator is not ready to accept Ceph command but the cluster exists
+		if !cephObjectStoreUser.GetDeletionTimestamp().IsZero() && !cephClusterExists {
+			// Remove finalizer
+			err = opcontroller.RemoveFinalizer(r.opManagerContext, r.client, cephObjectStoreUser)
+			if err != nil {
+				return reconcile.Result{}, *cephObjectStoreUser, errors.Wrap(err, "failed to remove finalizer")
+			}
+
+			// Return and do not requeue. Successful deletion.
+			return reconcile.Result{}, *cephObjectStoreUser, nil
+		}
+		return reconcileResponse, *cephObjectStoreUser, nil
+	}
+	r.cephClusterSpec = &cephCluster.Spec
+
+	// Populate clusterInfo during each reconcile
+	r.clusterInfo, _, _, err = opcontroller.LoadClusterInfo(r.context, r.opManagerContext, clusterNamespace.Namespace, r.cephClusterSpec)
+	if err != nil {
+		return reconcile.Result{}, *cephObjectStoreUser, errors.Wrap(err, "failed to populate cluster info")
+	}
+
+	runningCephVersion, err := cephclient.LeastUptodateDaemonVersion(r.context, r.clusterInfo, config.MonType)
+	if err != nil {
+		return reconcile.Result{}, *cephObjectStoreUser, errors.Wrapf(err, "failed to retrieve current ceph %q version", config.MonType)
+	}
+	r.clusterInfo.CephVersion = runningCephVersion
+
+	// Validate the object store has been initialized
+	err = r.initializeObjectStoreContext(cephObjectStoreUser)
+	if err != nil {
+		if !cephObjectStoreUser.GetDeletionTimestamp().IsZero() {
+			// Remove finalizer
+			err = opcontroller.RemoveFinalizer(r.opManagerContext, r.client, cephObjectStoreUser)
+			if err != nil {
+				return reconcile.Result{}, *cephObjectStoreUser, errors.Wrap(err, "failed to remove finalizer")
+			}
+			r.recorder.Eventf(cephObjectStoreUser, nil, corev1.EventTypeNormal, string(cephv1.ReconcileSucceeded), string(cephv1.ReconcileSucceeded), "successfully removed finalizer")
+
+			// Return and do not requeue. Successful deletion.
+			return reconcile.Result{}, *cephObjectStoreUser, nil
+		}
+		log.NamedDebug(request.NamespacedName, logger, "ObjectStore resource not ready, retrying in %q. %v",
+			opcontroller.WaitForRequeueIfCephClusterNotReady.RequeueAfter.String(), err)
+		return opcontroller.WaitForRequeueIfCephClusterNotReady, *cephObjectStoreUser, err
+	}
+
+	// DELETE: the CR was deleted
+	if !cephObjectStoreUser.GetDeletionTimestamp().IsZero() {
+		log.NamedDebug(request.NamespacedName, logger, "deleting object store user")
+		r.recorder.Eventf(cephObjectStoreUser, nil, corev1.EventTypeNormal, string(cephv1.ReconcileStarted), string(cephv1.ReconcileStarted), "deleting CephObjectStoreUser %q", cephObjectStoreUser.Name)
+
+		err := r.deleteUser(cephObjectStoreUser)
+		if err != nil {
+			return reconcile.Result{}, *cephObjectStoreUser, errors.Wrapf(err, "failed to delete ceph object user %q", cephObjectStoreUser.Name)
+		}
+
+		// Remove finalizer
+		err = opcontroller.RemoveFinalizer(r.opManagerContext, r.client, cephObjectStoreUser)
+		if err != nil {
+			return reconcile.Result{}, *cephObjectStoreUser, errors.Wrap(err, "failed to remove finalizer")
+		}
+		r.recorder.Eventf(cephObjectStoreUser, nil, corev1.EventTypeNormal, string(cephv1.ReconcileSucceeded), string(cephv1.ReconcileSucceeded), "successfully removed finalizer")
+
+		// Return and do not requeue. Successful deletion.
+		return reconcile.Result{}, *cephObjectStoreUser, nil
+	}
+
+	// CR is not deleted, continue reconciling
+
+	// Generate user config
+	userConfig, err := generateUserConfig(cephObjectStoreUser, r.clusterInfo.CephVersion)
+	if err != nil {
+		return reconcile.Result{}, *cephObjectStoreUser, errors.Wrapf(err, "failed to generate user config for %q", cephObjectStoreUser.Name)
+	}
+
+	referencedSecrets := &map[types.UID]*corev1.Secret{}
+	// Set any provided key pair(s)
+	if len(cephObjectStoreUser.Spec.Keys) > 0 {
+		var keys *[]admin.UserKeySpec
+		keys, referencedSecrets, err = r.generateUserKeySpec(cephObjectStoreUser)
+		if err != nil {
+			return reconcile.Result{}, *cephObjectStoreUser, errors.Wrapf(err, "failed to generate UserKeySpec for %q", cephObjectStoreUser.Name)
+		}
+
+		userConfig.Keys = *keys
+	}
+
+	// validate the user settings
+	err = r.validateUser(cephObjectStoreUser)
+	if err != nil {
+		return reconcile.Result{}, *cephObjectStoreUser, errors.Wrapf(err, "invalid CephObjectStoreUser %q spec", cephObjectStoreUser.Name)
+	}
+
+	// Resolve account reference if set
+	if cephObjectStoreUser.Spec.AccountRef.Name != "" {
+		accountID, result, err := r.resolveAccountRef(cephObjectStoreUser)
+		if err != nil {
+			return result, *cephObjectStoreUser, err
+		}
+		userConfig.AccountID = accountID
+	}
+
+	// CREATE/UPDATE CEPH USER
+	reconcileResponse, liveUser, err := r.reconcileCephUser(cephObjectStoreUser, userConfig)
+	if err != nil {
+		return reconcileResponse, *cephObjectStoreUser, err
+	}
+
+	// Update status of referenced secrets only after the rgw user has
+	// reconciled. Update even when no secrets are referenced as this could be a
+	// transition from explicit keys -> automatic secret generation.
+	r.updateKeyStatus(request.NamespacedName, referencedSecrets)
+
+	// CREATE/UPDATE KUBERNETES SECRET
+	store, err := r.getObjectStore(cephObjectStoreUser)
+	if err != nil {
+		return reconcile.Result{}, *cephObjectStoreUser, errors.Wrapf(err, "failed to get object store %q", cephObjectStoreUser.Spec.Store)
+	}
+
+	tlsSecretName := store.Spec.Gateway.SSLCertificateRef
+	reconcileResponse, err = r.reconcileCephUserSecret(cephObjectStoreUser, userConfig, tlsSecretName)
+	if err != nil {
+		return reconcileResponse, *cephObjectStoreUser, err
+	}
+
+	// update ObservedGeneration in status at the end of reconcile
+	// Set Ready status, we are done reconciling
+	r.updateStatus(observedGeneration, request.NamespacedName, k8sutil.ReadyStatus, liveUser)
+
+	// Return and do not requeue
+	log.NamedDebug(request.NamespacedName, logger, "done reconciling")
+	return reconcile.Result{}, *cephObjectStoreUser, nil
+}
+
+func (r *ReconcileObjectStoreUser) reconcileCephUser(cephObjectStoreUser *cephv1.CephObjectStoreUser, userConfig *admin.User) (reconcile.Result, *admin.User, error) {
+	liveUser, err := r.createOrUpdateCephUser(cephObjectStoreUser, userConfig)
+	if err != nil {
+		return reconcile.Result{}, nil, errors.Wrapf(err, "failed to create/update object store user %q", cephObjectStoreUser.Name)
+	}
+
+	return reconcile.Result{}, liveUser, nil
+}
+
+func (r *ReconcileObjectStoreUser) createOrUpdateCephUser(u *cephv1.CephObjectStoreUser, targetUser *admin.User) (*admin.User, error) {
+	nsName := opcontroller.NsName(u.Namespace, u.Name)
+	log.NamedInfo(nsName, logger, "creating ceph object user")
+
+	logCreateOrUpdate := fmt.Sprintf("retrieved existing ceph object user %q", u.Name)
+	// lookup user by name only and not by access key
+	liveUser, err := r.objContext.AdminOpsClient.GetUser(r.opManagerContext, admin.User{ID: u.Name})
+	if err != nil {
+		if errors.Is(err, admin.ErrNoSuchUser) {
+			liveUser, err = r.objContext.AdminOpsClient.CreateUser(r.opManagerContext, *targetUser)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to create ceph object user %v", &targetUser.ID)
+			}
+			logCreateOrUpdate = fmt.Sprintf("created ceph object user %q", u.Name)
+		} else {
+			return nil, errors.Wrapf(err, "failed to get details from ceph object user %q", u.Name)
+		}
+	}
+
+	// Update simple scalar fields supported by admin.ModifyUser() excluding keys, as this method is unable to handle multiple keys.
+	if !isUserSync(targetUser, &liveUser) {
+		preserveLiveStorageClass(targetUser, &liveUser, r.clusterInfo.CephVersion)
+
+		liveUser, err = r.objContext.AdminOpsClient.ModifyUser(r.opManagerContext, *targetUser)
+		if err != nil {
+			return nil, errors.Wrapf(err, "failed to update ceph object user %q", targetUser.ID)
+		}
+		logCreateOrUpdate = fmt.Sprintf("updated ceph object user %q", u.Name)
+	}
+
+	// Generate the user caps "string" for the live user, since the API does not return the caps in a "string" format as a list of Cap structs. Since go-ceph will only set caps via the "string" format, we need to generate the string format for the live user to compare with the target user caps "string".
+	liveUser.UserCaps = generateUserCaps(&liveUser)
+	// Update caps, if necessary
+	log.NamedTrace(nsName, logger, "user capabilities(id: %s, caps: %#v, user caps: %s, op mask: %s)",
+		liveUser.ID, liveUser.Caps, liveUser.UserCaps, liveUser.OpMask)
+	if targetUser.UserCaps != liveUser.UserCaps {
+		// If there are no caps to be removed, the API will return an error "missing user capabilities"
+		if liveUser.UserCaps != "" {
+			log.NamedTrace(nsName, logger, "remove capabilities %s from user %s", liveUser.UserCaps, targetUser.ID)
+			_, err = r.objContext.AdminOpsClient.RemoveUserCap(r.opManagerContext, targetUser.ID, liveUser.UserCaps)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to remove current ceph object user %q capabilities", targetUser.ID)
+			}
+		}
+		if targetUser.UserCaps != "" {
+			log.NamedTrace(nsName, logger, "set capabilities %s for user %s", targetUser.UserCaps, targetUser.ID)
+			_, err = r.objContext.AdminOpsClient.AddUserCap(r.opManagerContext, targetUser.ID, targetUser.UserCaps)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to update ceph object user %q capabilities", targetUser.ID)
+			}
+		}
+		logCreateOrUpdate = fmt.Sprintf("updated ceph object user %q", u.Name)
+	}
+
+	quotaEnabled := false
+	var maxSize int64 = -1
+	var maxObjects int64 = -1
+	if u.Spec.Quotas != nil {
+		if u.Spec.Quotas.MaxObjects != nil {
+			maxObjects = *u.Spec.Quotas.MaxObjects
+			quotaEnabled = true
+		}
+		if u.Spec.Quotas.MaxSize != nil {
+			maxSize = u.Spec.Quotas.MaxSize.Value()
+			quotaEnabled = true
+		}
+	}
+	userQuota := admin.QuotaSpec{
+		UID:        u.Name,
+		Enabled:    &quotaEnabled,
+		MaxSize:    &maxSize,
+		MaxObjects: &maxObjects,
+	}
+	err = r.objContext.AdminOpsClient.SetUserQuota(r.opManagerContext, userQuota)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to set quotas for user %q", u.Name)
+	}
+
+	if len(targetUser.Keys) == 0 {
+		// use the keys already set on the user & remove all but one key
+		if len(liveUser.Keys) == 0 {
+			// something is wrong, there should be at least one key
+			return nil, errors.Errorf("no keys set for user %q", u.Name)
+		}
+
+		targetUser.Keys = []admin.UserKeySpec{liveUser.Keys[0]}
+		log.NamedDebug(nsName, logger, "reducing user %q from %d keypairs to 1", u.Name, len(liveUser.Keys))
+	}
+
+	if err := r.reconcileUserKeys(nsName, targetUser.Keys); err != nil {
+		return nil, errors.Wrapf(err, "failed to reconcile keys for user %q", u.Name)
+	}
+	log.NamedInfo(nsName, logger, "%s", logCreateOrUpdate)
+
+	return &liveUser, nil
+}
+
+func (r *ReconcileObjectStoreUser) initializeObjectStoreContext(u *cephv1.CephObjectStoreUser) error {
+	opsContext, store, err := object.InitializeObjectStoreContext(r.context, r.clusterInfo, r.client, r.opManagerContext, u.Spec.Store, newMultisiteAdminOpsCtxFunc)
+	if err != nil {
+		return err
+	}
+
+	// Check if the object store allows users to be created in any namespace
+	if u.Spec.ClusterNamespace != "" && u.Spec.ClusterNamespace != u.Namespace {
+		if !userInNamespaceAllowed(u.Namespace, store.Spec.AllowUsersInNamespaces) {
+			return fmt.Errorf(
+				"object store %q does not allow creating users namespace %q, the namespace must first be added to allowUsersInNamespaces",
+				u.Spec.Store,
+				u.Namespace)
+		}
+	}
+
+	advertiseEndpoint, err := store.GetAdvertiseEndpointUrl()
+	if err != nil {
+		return errors.Wrapf(err, "failed to get CephObjectStore %q advertise endpoint for object store user", u.Spec.Store)
+	}
+	r.advertiseEndpoint = advertiseEndpoint
+	r.objContext = opsContext
+
+	return nil
+}
+
+func userInNamespaceAllowed(requestedNamespace string, allowedNamespaces []string) bool {
+	// Check if there is access to create the user in another namespace
+	for _, allowedNamespace := range allowedNamespaces {
+		if allowedNamespace == "*" || allowedNamespace == requestedNamespace {
+			log.NamespacedDebug(requestedNamespace, logger, "allow creating object user in namespace")
+			return true
+		}
+	}
+	return false
+}
+
+func generateUserCaps(user *admin.User) string {
+	var caps strings.Builder
+	for _, c := range user.Caps {
+		fmt.Fprintf(&caps, "%s=%s;", c.Type, c.Perm)
+	}
+	return caps.String()
+}
+
+// squidPlacementEncodingStillNeeded stops compiling once the minimum supported
+// Ceph major passes v19: the embedded "<placement>/<storage-class>" encoding in
+// generateUserConfig exists only for Squid, and this declaration is what turns
+// deleting it into a build failure instead of a reminder. Remove the encoding
+// arm, its tests, and this type together.
+type squidPlacementEncodingStillNeeded [19 - cephver.MinimumMajor]struct{}
+
+var _ squidPlacementEncodingStillNeeded
+
+func generateUserConfig(user *cephv1.CephObjectStoreUser, cephVersion cephver.CephVersion) (*admin.User, error) {
+	// Set DisplayName to match Name if DisplayName is not set
+	displayName := user.Spec.DisplayName
+	if len(displayName) == 0 {
+		displayName = user.Name
+	}
+
+	// create the user
+	userConfig := &admin.User{
+		ID:          user.Name,
+		DisplayName: displayName,
+		Keys:        make([]admin.UserKeySpec, 0),
+	}
+
+	defaultMaxBuckets := 1000
+	userConfig.MaxBuckets = &defaultMaxBuckets
+	if user.Spec.Quotas != nil && user.Spec.Quotas.MaxBuckets != nil {
+		userConfig.MaxBuckets = user.Spec.Quotas.MaxBuckets
+	}
+
+	if user.Spec.Capabilities != nil {
+		if user.Spec.Capabilities.User != "" {
+			userConfig.UserCaps += fmt.Sprintf("users=%s;", user.Spec.Capabilities.User)
+		}
+		if user.Spec.Capabilities.Users != "" {
+			userConfig.UserCaps += fmt.Sprintf("users=%s;", user.Spec.Capabilities.Users)
+		}
+		if user.Spec.Capabilities.Bucket != "" {
+			userConfig.UserCaps += fmt.Sprintf("buckets=%s;", user.Spec.Capabilities.Bucket)
+		}
+		if user.Spec.Capabilities.Buckets != "" {
+			userConfig.UserCaps += fmt.Sprintf("buckets=%s;", user.Spec.Capabilities.Buckets)
+		}
+		if user.Spec.Capabilities.MetaData != "" {
+			userConfig.UserCaps += fmt.Sprintf("metadata=%s;", user.Spec.Capabilities.MetaData)
+		}
+		if user.Spec.Capabilities.Usage != "" {
+			userConfig.UserCaps += fmt.Sprintf("usage=%s;", user.Spec.Capabilities.Usage)
+		}
+		if user.Spec.Capabilities.Zone != "" {
+			userConfig.UserCaps += fmt.Sprintf("zone=%s;", user.Spec.Capabilities.Zone)
+		}
+		if user.Spec.Capabilities.Roles != "" {
+			userConfig.UserCaps += fmt.Sprintf("roles=%s;", user.Spec.Capabilities.Roles)
+		}
+		if user.Spec.Capabilities.AMZCache != "" {
+			userConfig.UserCaps += fmt.Sprintf("amz-cache=%s;", user.Spec.Capabilities.AMZCache)
+		}
+		if user.Spec.Capabilities.BiLog != "" {
+			userConfig.UserCaps += fmt.Sprintf("bilog=%s;", user.Spec.Capabilities.BiLog)
+		}
+		if user.Spec.Capabilities.Info != "" {
+			userConfig.UserCaps += fmt.Sprintf("info=%s;", user.Spec.Capabilities.Info)
+		}
+		if user.Spec.Capabilities.MdLog != "" {
+			userConfig.UserCaps += fmt.Sprintf("mdlog=%s;", user.Spec.Capabilities.MdLog)
+		}
+		if user.Spec.Capabilities.DataLog != "" {
+			userConfig.UserCaps += fmt.Sprintf("datalog=%s;", user.Spec.Capabilities.DataLog)
+		}
+		if user.Spec.Capabilities.UserPolicy != "" {
+			userConfig.UserCaps += fmt.Sprintf("user-policy=%s;", user.Spec.Capabilities.UserPolicy)
+		}
+		if user.Spec.Capabilities.OidcProvider != "" {
+			userConfig.UserCaps += fmt.Sprintf("oidc-provider=%s;", user.Spec.Capabilities.OidcProvider)
+		}
+		if user.Spec.Capabilities.RateLimit != "" {
+			userConfig.UserCaps += fmt.Sprintf("ratelimit=%s;", user.Spec.Capabilities.RateLimit)
+		}
+		if user.Spec.Capabilities.UserInfoWithoutKeys != "" {
+			if !cephVersion.IsAtLeast(userInfoWithoutKeysMinCephVersion) {
+				log.NamedWarning(opcontroller.NsName(user.Namespace, user.Name), logger,
+					"capability user-info-without-keys requires Ceph %s or higher, but cluster is running %s",
+					userInfoWithoutKeysMinCephVersion.String(), cephVersion.String())
+			} else {
+				userConfig.UserCaps += fmt.Sprintf("user-info-without-keys=%s;", user.Spec.Capabilities.UserInfoWithoutKeys)
+			}
+		}
+		if user.Spec.Capabilities.Accounts != "" {
+			if !cephVersion.IsAtLeast(accountsMinCephVersion) {
+				log.NamedWarning(opcontroller.NsName(user.Namespace, user.Name), logger,
+					"capability accounts requires Ceph %s or higher, but cluster is running %s",
+					accountsMinCephVersion.String(), cephVersion.String())
+			} else {
+				userConfig.UserCaps += fmt.Sprintf("accounts=%s;", user.Spec.Capabilities.Accounts)
+			}
+		}
+	}
+
+	nsName := opcontroller.NsName(user.Namespace, user.Name)
+
+	var opMask string
+	if user.Spec.OpMask != nil && *user.Spec.OpMask != nil {
+		mask, err := opmask.FromSlice(*user.Spec.OpMask)
+		if err != nil {
+			return nil, errors.Wrapf(err, "invalid op-mask specified for user %q", user.Name)
+		}
+		opMask = mask.String()
+
+		if opMask == "<none>" {
+			log.NamedTrace(nsName, logger, "removing all operations from op-mask for user %q", user.Name)
+		} else {
+			log.NamedTrace(nsName, logger, "setting op-mask for user %q: %v", user.Name, user.Spec.OpMask)
+		}
+	} else {
+		// If no explicit opmask is set, default to read/write/delete permissions, which is the default that the RGW applies when creating a user via the admin ops API.
+		opMask = "read, write, delete"
+
+		log.NamedTrace(nsName, logger, "setting default op-mask for user %q: %v", user.Name, opMask)
+	}
+
+	userConfig.OpMask = opMask
+
+	// Do not manage if unset. https://github.com/ceph/ceph/pull/71199
+	if user.Spec.DefaultPlacement != "" {
+		userConfig.DefaultPlacement = user.Spec.DefaultPlacement
+		if cephVersion.IsAtLeastTentacle() {
+			userConfig.DefaultStorageClass = user.Spec.DefaultStorageClass
+		} else if user.Spec.DefaultStorageClass != "" {
+			// Squid's admin ops API never reads default-storage-class and splits
+			// the placement rule on "/" instead; https://tracker.ceph.com/issues/66439
+			// changed that in Tentacle and was not backported. The build fails
+			// through squidPlacementEncodingStillNeeded once Squid leaves the
+			// support window; drop this arm then.
+			userConfig.DefaultPlacement += "/" + user.Spec.DefaultStorageClass
+		}
+	}
+
+	return userConfig, nil
+}
+
+func generateCephUserSecretName(u *cephv1.CephObjectStoreUser) string {
+	return fmt.Sprintf("rook-ceph-object-user-%s-%s", u.Spec.Store, u.Name)
+}
+
+func generateStatusInfo(u *cephv1.CephObjectStoreUser, liveUser *admin.User) map[string]string {
+	m := make(map[string]string)
+	m["secretName"] = generateCephUserSecretName(u)
+	if liveUser != nil {
+		if live := placementRuleOf(liveUser); live.hasPlacement() {
+			m["defaultPlacement"] = live.name
+			m["defaultStorageClass"] = live.canonicalStorageClass()
+		}
+	}
+	return m
+}
+
+func (r *ReconcileObjectStoreUser) generateCephUserSecret(u *cephv1.CephObjectStoreUser, userConfig *admin.User, tlsSecretName string) *corev1.Secret {
+	// Store the keys in a secret
+	secrets := map[string]string{
+		"AccessKey": userConfig.Keys[0].AccessKey,
+		"SecretKey": userConfig.Keys[0].SecretKey,
+		"Endpoint":  r.objContext.Endpoint,
+	}
+	if tlsSecretName != "" {
+		secrets["SSLCertSecretName"] = tlsSecretName
+	}
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      generateCephUserSecretName(u),
+			Namespace: u.Namespace,
+			Labels:    cephUserSecretLabels(u),
+		},
+		StringData: secrets,
+		Type:       k8sutil.RookType,
+	}
+	cephv1.Labels(secretTemplateLabels(u.Spec.SecretTemplate)).ApplyToObjectMeta(&secret.ObjectMeta)
+	cephv1.Annotations(secretTemplateAnnotations(u.Spec.SecretTemplate)).ApplyToObjectMeta(&secret.ObjectMeta)
+	return secret
+}
+
+// cephUserSecretLabels returns the labels Rook sets on the user's Secret.
+// secretTemplate cannot override them. The CRD's secretTemplate rules reserve
+// these keys by name, so a label added here must use a rook.io prefix, which
+// those rules already reserve.
+func cephUserSecretLabels(u *cephv1.CephObjectStoreUser) map[string]string {
+	return map[string]string{
+		"app":               appName,
+		"user":              u.Name,
+		"rook_cluster":      u.Namespace,
+		"rook_object_store": u.Spec.Store,
+	}
+}
+
+func secretTemplateLabels(t cephv1.SecretTemplate) map[string]string {
+	labels := make(map[string]string, len(t.Labels))
+	for k, v := range t.Labels {
+		labels[k] = string(v)
+	}
+	return labels
+}
+
+func secretTemplateAnnotations(t cephv1.SecretTemplate) map[string]string {
+	annotations := make(map[string]string, len(t.Annotations))
+	for k, v := range t.Annotations {
+		annotations[k] = string(v)
+	}
+	return annotations
+}
+
+// reservedSecretKeyPrefix matches label and annotation keys in the rook.io
+// namespace, which Rook acts on; for example, the CSI controllers choose their
+// credential Secrets by csi.rook.io annotations.
+var reservedSecretKeyPrefix = regexp.MustCompile(`^([^/]*\.)?rook\.io/`)
+
+// validateSecretTemplate applies the checks that the CephObjectStoreUser CRD's
+// secretTemplate rules make at admission, plus the API server's own Secret
+// metadata validation, so that invalid metadata is caught before the RGW user
+// is changed rather than when the Secret is written afterwards.
+func validateSecretTemplate(u *cephv1.CephObjectStoreUser) error {
+	fldPath := field.NewPath("spec", "secretTemplate")
+	labelsPath := fldPath.Child("labels")
+	annotationsPath := fldPath.Child("annotations")
+	labels := secretTemplateLabels(u.Spec.SecretTemplate)
+	annotations := secretTemplateAnnotations(u.Spec.SecretTemplate)
+
+	errs := metav1validation.ValidateLabels(labels, labelsPath)
+	errs = append(errs, apimachineryvalidation.ValidateAnnotations(annotations, annotationsPath)...)
+
+	rookLabels := cephUserSecretLabels(u)
+	for _, k := range slices.Sorted(maps.Keys(labels)) {
+		_, setByRook := rookLabels[k]
+		if setByRook || k == opcontroller.DoNotReconcileLabelName || reservedSecretKeyPrefix.MatchString(k) {
+			errs = append(errs, field.Forbidden(labelsPath.Key(k), "reserved by Rook"))
+		}
+	}
+	for _, k := range slices.Sorted(maps.Keys(annotations)) {
+		if k == keyring.KeyringAnnotation || reservedSecretKeyPrefix.MatchString(k) {
+			errs = append(errs, field.Forbidden(annotationsPath.Key(k), "reserved by Rook"))
+		}
+	}
+	return errs.ToAggregate()
+}
+
+func (r *ReconcileObjectStoreUser) reconcileCephUserSecret(cephObjectStoreUser *cephv1.CephObjectStoreUser, userConfig *admin.User, tlsSecretName string) (reconcile.Result, error) {
+	// Generate Kubernetes Secret
+	secret := r.generateCephUserSecret(cephObjectStoreUser, userConfig, tlsSecretName)
+
+	// Set owner ref to the object store user object
+	if err := controllerutil.SetControllerReference(cephObjectStoreUser, secret, r.scheme); err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to set owner reference of ceph object user secret %q", secret.Name)
+	}
+
+	// Create Kubernetes Secret
+	if err := opcontroller.CreateOrUpdateObject(r.opManagerContext, r.client, secret); err != nil {
+		return reconcile.Result{}, errors.Wrapf(err, "failed to create or update ceph object user %q secret", secret.Name)
+	}
+
+	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileObjectStoreUser) getObjectStore(user *cephv1.CephObjectStoreUser) (*cephv1.CephObjectStore, error) {
+	storeName := user.Spec.Store
+	nsName := client.ObjectKeyFromObject(user)
+
+	// check if CephObjectStore CR is created
+	objectStores := &cephv1.CephObjectStoreList{}
+	err := r.client.List(r.opManagerContext, objectStores)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return nil, errors.Wrapf(err, "could not find CephObjectStore %q referenced by CephObjectStoreUser %q", storeName, nsName)
+		}
+		return nil, errors.Wrapf(err, "failed to list CephObjectStore(s) for CephObjectStoreUser %q", nsName)
+	}
+
+	for _, store := range objectStores.Items {
+		if store.Name == storeName {
+			log.NamedDebug(opcontroller.NsName(user.Namespace, user.Name), logger, "found CephObjectStore %q referenced by CephObjectStoreUser", storeName)
+			return &store, nil
+		}
+	}
+
+	return nil, errors.Errorf("could not find CephObjectStore %q referenced by CephObjectStoreUser %q", storeName, nsName)
+}
+
+// Namespace where the object store and cluster are expected to be found
+func clusterStoreNamespace(user *cephv1.CephObjectStoreUser) string {
+	if user.Spec.ClusterNamespace != "" {
+		return user.Spec.ClusterNamespace
+	}
+	return user.Namespace
+}
+
+// Delete the user
+func (r *ReconcileObjectStoreUser) deleteUser(u *cephv1.CephObjectStoreUser) error {
+	nsName := opcontroller.NsName(u.Namespace, u.Name)
+	err := r.objContext.AdminOpsClient.RemoveUser(r.opManagerContext, admin.User{ID: u.Name})
+	if err != nil {
+		if errors.Is(err, admin.ErrNoSuchUser) {
+			log.NamedWarning(nsName, logger, "user does not exist, nothing to remove")
+			return nil
+		}
+		return errors.Wrapf(err, "failed to delete ceph object user %q.", u.Name)
+	}
+
+	log.NamedInfo(nsName, logger, "ceph object user deleted successfully")
+	return nil
+}
+
+// validateUser validates the user arguments
+func (r *ReconcileObjectStoreUser) validateUser(u *cephv1.CephObjectStoreUser) error {
+	if u.Name == "" {
+		return errors.New("missing name")
+	}
+	if u.Namespace == "" {
+		return errors.New("missing namespace")
+	}
+	if u.Spec.Store == "" {
+		return errors.New("missing store")
+	}
+	// When accountRef is set, validate that displayName is IAM-compatible
+	if u.Spec.AccountRef.Name != "" {
+		displayName := u.Spec.DisplayName
+		if displayName == "" {
+			displayName = u.Name
+		}
+		if !iamDisplayNamePattern.MatchString(displayName) {
+			return fmt.Errorf("displayName %q is not IAM-compatible (must match [\\w+=,.@-]+) when accountRef is set", displayName)
+		}
+	}
+	return validateSecretTemplate(u)
+}
+
+// waitForRequeueIfRGWAccountNotReady waits for the referenced CephObjectStoreAccount to be ready
+var waitForRequeueIfRGWAccountNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
+
+// resolveAccountRef looks up the CephObjectStoreAccount referenced by accountRef, validates
+// that the store fields match, and returns the account ID. If the account is not yet ready,
+// it returns an empty account ID and a requeue result.
+func (r *ReconcileObjectStoreUser) resolveAccountRef(u *cephv1.CephObjectStoreUser) (string, reconcile.Result, error) {
+	nsName := opcontroller.NsName(u.Namespace, u.Name)
+	accountName := u.Spec.AccountRef.Name
+
+	account := &cephv1.CephObjectStoreAccount{}
+	err := r.client.Get(r.opManagerContext, types.NamespacedName{Name: accountName, Namespace: u.Namespace}, account)
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			return "", waitForRequeueIfRGWAccountNotReady, fmt.Errorf("referenced CephObjectStoreAccount %q not found", accountName)
+		}
+		return "", reconcile.Result{}, errors.Wrapf(err, "failed to get CephObjectStoreAccount %q", accountName)
+	}
+
+	// Validate that the store field matches
+	if account.Spec.Store != u.Spec.Store {
+		return "", reconcile.Result{}, fmt.Errorf("store %q on CephObjectStoreUser does not match store %q on referenced CephObjectStoreAccount %q", u.Spec.Store, account.Spec.Store, accountName)
+	}
+
+	// Wait for the account to be ready
+	if account.Status == nil || account.Status.Phase != k8sutil.ReadyStatus {
+		return "", waitForRequeueIfRGWAccountNotReady, fmt.Errorf("referenced CephObjectStoreAccount %q is not ready", accountName)
+	}
+
+	accountID := account.Status.AccountID
+	if accountID == "" {
+		return "", waitForRequeueIfRGWAccountNotReady, fmt.Errorf("referenced CephObjectStoreAccount %q has no account ID yet", accountName)
+	}
+
+	log.NamedDebug(nsName, logger, "resolved account reference %q to account ID %q", accountName, accountID)
+	return accountID, reconcile.Result{}, nil
+}
+
+// updateStatus updates an object with a given status. liveUser, when non-nil,
+// is the rgw user as reported by the admin ops API at the end of a successful
+// reconcile; its effective state is echoed into `.status.info`.
+func (r *ReconcileObjectStoreUser) updateStatus(observedGeneration int64, name types.NamespacedName, status string, liveUser *admin.User) {
+	user := &cephv1.CephObjectStoreUser{}
+	if err := r.client.Get(r.opManagerContext, name, user); err != nil {
+		if kerrors.IsNotFound(err) {
+			log.NamedDebug(name, logger, "CephObjectStoreUser resource not found. Ignoring since object must be deleted.")
+			return
+		}
+		log.NamedWarning(name, logger, "failed to retrieve object store user %q to update status to %q. %v", name, status, err)
+		return
+	}
+	if user.Status == nil {
+		user.Status = &cephv1.ObjectStoreUserStatus{}
+	}
+
+	user.Status.Phase = status
+	if user.Status.Phase == k8sutil.ReadyStatus {
+		user.Status.Info = generateStatusInfo(user, liveUser)
+	}
+	if observedGeneration != k8sutil.ObservedGenerationNotAvailable {
+		user.Status.ObservedGeneration = observedGeneration
+	}
+	if err := reporting.UpdateStatus(r.client, user); err != nil {
+		log.NamedError(name, logger, "failed to set object store user %q status to %q. %v", name, status, err)
+		return
+	}
+	log.NamedDebug(name, logger, "object store user %q status updated to %q", name, status)
+}
+
+// updates `.status.keys`. This functionality is not included as part of
+// updateStatus() so that the list of referenced secrets, if any, can be
+// updated at the same time the rgw user key set is reconciled. This avoids the
+// need to regenerate the list of referenced secrets a second time when the
+// reconcile has completed and the overall resource status is updated.
+func (r *ReconcileObjectStoreUser) updateKeyStatus(name types.NamespacedName, referencedSecrets *map[types.UID]*corev1.Secret) {
+	user := &cephv1.CephObjectStoreUser{}
+	if err := r.client.Get(r.opManagerContext, name, user); err != nil {
+		if kerrors.IsNotFound(err) {
+			log.NamedDebug(name, logger, "CephObjectStoreUser resource not found. Ignoring since object must be deleted.")
+			return
+		}
+		log.NamedWarning(name, logger, "failed to retrieve CephObjectStoreUser to update .status.keys. %v", err)
+		return
+	}
+	if user.Status == nil {
+		user.Status = &cephv1.ObjectStoreUserStatus{}
+	}
+
+	keyStatus := []cephv1.SecretReference{}
+
+	for _, secret := range *referencedSecrets {
+		keyStatus = append(keyStatus, cephv1.SecretReference{
+			SecretReference: corev1.SecretReference{
+				Name:      secret.Name,
+				Namespace: secret.Namespace,
+			},
+			UID:             secret.UID,
+			ResourceVersion: secret.ResourceVersion,
+		})
+	}
+
+	// assume map key ordering is unstable between reconciles and sort the slice
+	// by secret name
+	sort.Slice(keyStatus, func(i, j int) bool {
+		return keyStatus[i].Name < keyStatus[j].Name
+	})
+
+	// log the secret references rather than the secrets themselves: corev1.Secret
+	// carries a generated String() that prints its whole Data map
+	log.NamedDebug(name, logger, "updating CephObjectStoreUser .status.keys to %+v", keyStatus)
+
+	user.Status.Keys = keyStatus
+
+	if err := reporting.UpdateStatus(r.client, user); err != nil {
+		log.NamedWarning(name, logger, "failed to update CephObjectStoreUser.status.keys. %v", err)
+		return
+	}
+	log.NamedDebug(name, logger, "updated CephObjectStoreUser.status.keys")
+}
+
+// getSecretValue returns the value of key in a kubernetes secret
+func (r *ReconcileObjectStoreUser) getSecretValue(selector *corev1.SecretKeySelector, namespace string) (string, *corev1.Secret, error) {
+	secret := &corev1.Secret{}
+	namespacedName := types.NamespacedName{
+		Name:      selector.Name,
+		Namespace: namespace,
+	}
+	if err := r.client.Get(r.opManagerContext, namespacedName, secret); err != nil {
+		return "", nil, errors.Wrapf(err, "failed to get secret %q", namespacedName)
+	}
+	value, ok := secret.Data[selector.Key]
+	if !ok {
+		return "", nil, errors.Errorf("failed to find key %q in secret %q", selector.Key, namespacedName)
+	}
+
+	return string(value), secret, nil
+}
+
+// reconcileUserKeys ensures the user's RGW keys match exactly the targetKeys slice.  Any keys set on the user but not present in targetKeys are purged.
+func (r *ReconcileObjectStoreUser) reconcileUserKeys(nsName types.NamespacedName, targetKeys []admin.UserKeySpec) error {
+	ctx := r.opManagerContext
+	client := r.objContext.AdminOpsClient
+	userID := nsName.Name
+
+	// fetch the current user keys
+	userInfo, err := client.GetUser(ctx, admin.User{ID: userID})
+	if err != nil {
+		return errors.Wrapf(err, "failed to get user %q", userID)
+	}
+
+	// create a lookup for the targetKeys (by AccessKey)
+	targetMap := make(map[string]admin.UserKeySpec, len(targetKeys))
+	for _, k := range targetKeys {
+		targetMap[k.AccessKey] = k
+	}
+
+	syncdKeys := make([]admin.UserKeySpec, len(targetKeys))
+
+	// remove any keys configured for the user that aren't present in targetKeys
+	for i, existingKey := range userInfo.Keys {
+		targetKey, found := targetMap[existingKey.AccessKey]
+		if !found {
+			// RemoveKey() requires the UID to be set but GetUser() returns the list of keys with only .User set
+			rmKey := existingKey
+			rmKey.UID = userID
+
+			if err := client.RemoveKey(ctx, rmKey); err != nil {
+				// the returned error omits the access key ID because it reaches Kubernetes
+				// events and the CR status; name the key here so debug logs still have it
+				log.NamedDebug(nsName, logger, "failed to remove key %q from user %q. %v", existingKey.AccessKey, userID, err)
+				return errors.Wrapf(err, "failed to remove key %d from user %q", i, userID)
+			}
+			log.NamedDebug(nsName, logger, "removed key %q from user %q as it is not in the target list", existingKey.AccessKey, userID)
+			continue
+		}
+		if existingKey.SecretKey != targetKey.SecretKey {
+			// key exists but needs to be updated; delete it so it will be recreated
+			// RemoveKey() requires the UID to be set but GetUser() returns the list of keys with only .User set
+			rmKey := existingKey
+			rmKey.UID = userID
+
+			if err := client.RemoveKey(ctx, rmKey); err != nil {
+				log.NamedDebug(nsName, logger, "failed to remove key %q from user %q. %v", existingKey.AccessKey, userID, err)
+				return errors.Wrapf(err, "failed to remove key %d from user %q", i, userID)
+			}
+			log.NamedDebug(nsName, logger, "removed key %q from user %q as it needs to be recreated", existingKey.AccessKey, userID)
+			continue
+		}
+		// else key exists and is correct, no action needed
+		// defer removal from targetMap until after the loop to avoid changing the map while iterating
+		syncdKeys = append(syncdKeys, targetKey)
+	}
+
+	// remove any keys from targetKeys that are already in sync
+	for _, k := range syncdKeys {
+		delete(targetMap, k.AccessKey)
+	}
+
+	// create each desired key
+	for _, k := range targetMap {
+		if _, err := client.CreateKey(ctx, k); err != nil {
+			log.NamedDebug(nsName, logger, "failed to create key %q for user %q. %v", k.AccessKey, userID, err)
+			return errors.Wrapf(err, "failed to create a key for user %q", userID)
+		}
+		log.NamedDebug(nsName, logger, "created key %q for user %q", k.AccessKey, userID)
+	}
+
+	return nil
+}
+
+// Construct a []admin.UserKeySpec from all secrets referenced from CephObjectStoreUser.Spec.Keys
+func (r *ReconcileObjectStoreUser) generateUserKeySpec(user *cephv1.CephObjectStoreUser) (*[]admin.UserKeySpec, *map[types.UID]*corev1.Secret, error) {
+	referencedSecrets := make(map[types.UID]*corev1.Secret)
+
+	keys := make([]admin.UserKeySpec, len(user.Spec.Keys))
+	for _, key := range user.Spec.Keys {
+		accessKey, secret, err := r.getSecretValue(key.AccessKeyRef, user.Namespace)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to get secret value")
+		}
+		referencedSecrets[secret.UID] = secret
+
+		secretKey, secret, err := r.getSecretValue(key.SecretKeyRef, user.Namespace)
+		if err != nil {
+			return nil, nil, errors.Wrapf(err, "failed to get secret value")
+		}
+		referencedSecrets[secret.UID] = secret
+
+		keys = append(keys, admin.UserKeySpec{
+			UID:       user.Name,
+			AccessKey: accessKey,
+			SecretKey: secretKey,
+			KeyType:   "s3",
+		})
+	}
+
+	return &keys, &referencedSecrets, nil
+}
+
+// Determine if the simple scalar fields, supported by CephObjectStoreUser, of two `admin.User`s are in sync.
+// This is intended to determine if an update is needed/possible via AdminOpsClient.ModifyUser().
+// AdminOpsClient.ModifyUser() does not currently support updating all types of user configuration and only supports:
+//
+//	[]string{"uid", "display-name", "default-placement", "default-storage-class", "email", "generate-key", "access-key", "secret-key", "key-type", "max-buckets", "suspended", "op-mask"}))
+//
+// While this method does have support for updating keys, it is unable to handle multiple keys, so key reconciliation needs to be handled separately.
+// There is also no support for updating capabilities via ModifyUser().
+func isUserSync(targetUser, liveUser *admin.User) bool {
+	if targetUser.DisplayName != liveUser.DisplayName {
+		return false
+	}
+
+	if targetUser.MaxBuckets == nil && liveUser.MaxBuckets != nil ||
+		targetUser.MaxBuckets != nil && liveUser.MaxBuckets == nil {
+		return false
+	}
+
+	if targetUser.MaxBuckets != nil && liveUser.MaxBuckets != nil && *targetUser.MaxBuckets != *liveUser.MaxBuckets {
+		return false
+	}
+
+	if targetUser.OpMask != liveUser.OpMask {
+		return false
+	}
+
+	target := placementRuleOf(targetUser)
+	if target.hasPlacement() {
+		live := placementRuleOf(liveUser)
+		if target.name != live.name {
+			return false
+		}
+		if target.hasStorageClass() && !target.sameStorageClass(live) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// placementRule is a user's default placement as RGW stores it: a placement
+// target and a storage class, where an empty storage class is RGW's default.
+// On a rule built from the CR spec, an unset field means the CR does not manage
+// it.
+type placementRule struct {
+	name         string
+	storageClass string
+}
+
+// placementRuleOf resolves either spelling of a user's default placement. On
+// Squid the storage class is embedded in the placement rule as
+// "<placement>/<storage-class>", while user info reports the two back as
+// separate fields.
+func placementRuleOf(user *admin.User) placementRule {
+	if name, sc, found := strings.Cut(user.DefaultPlacement, "/"); found {
+		return placementRule{name: name, storageClass: sc}
+	}
+	return placementRule{name: user.DefaultPlacement, storageClass: user.DefaultStorageClass}
+}
+
+func (r placementRule) hasPlacement() bool { return r.name != "" }
+
+func (r placementRule) hasStorageClass() bool { return r.storageClass != "" }
+
+// canonicalStorageClass is the storage class RGW applies: user info reports an
+// unset class as "" on Squid and Tentacle and as "STANDARD" on newer Ceph, and
+// both mean STANDARD.
+func (r placementRule) canonicalStorageClass() string {
+	if r.storageClass == "" {
+		return "STANDARD"
+	}
+	return r.storageClass
+}
+
+// sameStorageClass reports whether both rules apply the same storage class,
+// whichever spelling each carries.
+func (r placementRule) sameStorageClass(other placementRule) bool {
+	return r.canonicalStorageClass() == other.canonicalStorageClass()
+}
+
+// preserveLiveStorageClass carries the live user's default storage class into
+// target when the CR does not manage one.
+//
+// An RGW user's placement is a single {name, storage class} rule, and every
+// ModifyUser carrying default-placement rewrites the whole rule: Squid clears
+// the storage class when the value has no "/", and Tentacle leaves it empty
+// unless default-storage-class is sent. So a modify triggered by unrelated
+// drift — a display name, an op-mask — would silently reset the storage class
+// of a user whose CR sets only defaultPlacement.
+//
+// The class is not carried when the target names a different placement: that
+// target need not offer the same class, so the rule legitimately re-derives to
+// the new target's default.
+func preserveLiveStorageClass(targetUser, liveUser *admin.User, cephVersion cephver.CephVersion) {
+	target := placementRuleOf(targetUser)
+	if !target.hasPlacement() || target.hasStorageClass() {
+		return
+	}
+
+	live := placementRuleOf(liveUser)
+	if target.name != live.name || !live.hasStorageClass() {
+		return
+	}
+
+	if cephVersion.IsAtLeastTentacle() {
+		targetUser.DefaultStorageClass = live.storageClass
+		return
+	}
+	targetUser.DefaultPlacement = target.name + "/" + live.storageClass
+}

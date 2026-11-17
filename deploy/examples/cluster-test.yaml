@@ -1,0 +1,94 @@
+#################################################################################################################
+# Define the settings for the rook-ceph cluster with common settings for a small test cluster.
+# All nodes with available raw devices will be used for the Ceph cluster. One node is sufficient
+# in this example.
+
+# For example, to create the cluster:
+#   kubectl create -f crds.yaml -f common.yaml -f operator.yaml
+#   kubectl create -f cluster-test.yaml
+#################################################################################################################
+apiVersion: ceph.rook.io/v1
+kind: CephCluster
+metadata:
+  name: my-cluster
+  namespace: rook-ceph # namespace:cluster
+spec:
+  dataDirHostPath: /var/lib/rook
+  cephVersion:
+    image: quay.io/ceph/ceph:v20
+    allowUnsupported: true
+  security:
+    cephx:
+      csi:
+        keyType: aes # required when Kubernetes nodes don't run Linux kernel 7.0+
+  mon:
+    count: 1
+    allowMultiplePerNode: true
+  # test environments can skip ok-to-stop checks during upgrades
+  skipUpgradeChecks: true
+  mgr:
+    count: 1
+    allowMultiplePerNode: true
+    modules:
+      - name: rook
+        enabled: false
+  dashboard:
+    enabled: true
+  crashCollector:
+    disable: true
+  network:
+    connections:
+      requireMsgr2: true
+  storage:
+    useAllNodes: true
+    useAllDevices: true
+    allowDeviceClassUpdate: true
+    allowOsdCrushWeightUpdate: false
+    #deviceFilter:
+    #config:
+    #  deviceClass: testclass
+  monitoring:
+    enabled: false
+  healthCheck:
+    daemonHealth:
+      mon:
+        interval: 45s
+        timeout: 600s
+    muteHealthWarning:
+      AUTH_INSECURE_ROTATING_SERVICE_KEY_TYPE:
+        policy: mute
+      AUTH_INSECURE_CLIENT_KEY_TYPE:
+        policy: mute
+      AUTH_INSECURE_KEYS_ALLOWED:
+        policy: mute
+      AUTH_INSECURE_KEYS_CREATABLE:
+        policy: mute
+  priorityClassNames:
+    all: system-node-critical
+    mgr: system-cluster-critical
+  disruptionManagement:
+    managePodBudgets: true
+  cephConfig:
+    global:
+      osd_pool_default_size: "1"
+      mon_warn_on_pool_no_redundancy: "false"
+      bdev_flock_retry: "20"
+      bluefs_buffered_io: "false"
+      mon_data_avail_warn: "10"
+      # several test OSDs share one small node; the 4Gi default overcommits its memory
+      osd_memory_target: "1073741824"
+      # multisite sync polls every log shard per interval; the defaults (64/128 shards)
+      # swamp small test clusters with sync traffic. Same tuning as ceph's multisite QA.
+      rgw_md_log_max_shards: "4"
+      rgw_data_log_num_shards: "4"
+---
+apiVersion: ceph.rook.io/v1
+kind: CephBlockPool
+metadata:
+  name: builtin-mgr
+  namespace: rook-ceph # namespace:cluster
+spec:
+  name: .mgr
+  replicated:
+    size: 1
+    requireSafeReplicaSize: false

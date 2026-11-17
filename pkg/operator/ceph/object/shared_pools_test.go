@@ -1,0 +1,2992 @@
+package object
+
+import (
+	"encoding/json"
+	"reflect"
+	"testing"
+	"time"
+
+	"github.com/coreos/pkg/capnslog"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/clusterd"
+	"github.com/rook/rook/pkg/daemon/ceph/client"
+	exectest "github.com/rook/rook/pkg/util/exec/test"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+)
+
+var testNsName = types.NamespacedName{Namespace: "rook-ceph", Name: "test"}
+
+func Test_validatePoolPlacements(t *testing.T) {
+	type args struct {
+		placements []cephv1.PoolPlacementSpec
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{
+			name: "valid: names unique",
+			args: args{
+				placements: []cephv1.PoolPlacementSpec{
+					{
+						Name:              "name1",
+						Default:           true,
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+					{
+						Name:              "name2",
+						Default:           false,
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid: duplicate names",
+			args: args{
+				placements: []cephv1.PoolPlacementSpec{
+					{
+						Name:              "name",
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+					{
+						Name:              "name",
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid: more than one default placement",
+			args: args{
+				placements: []cephv1.PoolPlacementSpec{
+					{
+						Name:              "one",
+						Default:           true,
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+					{
+						Name:              "two",
+						Default:           true,
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid: non-default placement with reserved name",
+			args: args{
+				placements: []cephv1.PoolPlacementSpec{
+					{
+						Name:              defaultPlacementCephConfigName,
+						Default:           false,
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+					{
+						Name:              "two",
+						Default:           true,
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "valid: default placement with reserved name",
+			args: args{
+				placements: []cephv1.PoolPlacementSpec{
+					{
+						Name:              defaultPlacementCephConfigName,
+						Default:           true,
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+					{
+						Name:              "two",
+						Default:           false,
+						MetadataPoolName:  "", // handled by CRD validation
+						DataPoolName:      "", // handled by CRD validation
+						DataNonECPoolName: "", // handled by CRD validation
+						StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validatePoolPlacements(tt.args.placements); (err != nil) != tt.wantErr {
+				t.Errorf("validatePoolPlacements() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func Test_validatePoolPlacementStorageClasses(t *testing.T) {
+	type args struct {
+		scList []cephv1.PlacementStorageClassSpec
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{
+			name: "valid: unique names",
+			args: args{
+				scList: []cephv1.PlacementStorageClassSpec{
+					{
+						Name:         "STANDARD_IA",
+						DataPoolName: "", // handled by CRD validation
+					},
+					{
+						Name:         "REDUCED_REDUNDANCY",
+						DataPoolName: "", // handled by CRD validation
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid: cannot override STANDARD",
+			args: args{
+				scList: []cephv1.PlacementStorageClassSpec{
+					{
+						Name:         "STANDARD",
+						DataPoolName: "", // handled by CRD validation
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid: duplicate names",
+			args: args{
+				scList: []cephv1.PlacementStorageClassSpec{
+					{
+						Name:         "STANDARD_IA",
+						DataPoolName: "", // handled by CRD validation
+					},
+					{
+						Name:         "STANDARD_IA",
+						DataPoolName: "", // handled by CRD validation
+					},
+				},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := validatePoolPlacementStorageClasses(tt.args.scList); (err != nil) != tt.wantErr {
+				t.Errorf("validatePoolPlacementStorageClasses() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestIsNeedToCreateObjectStorePools(t *testing.T) {
+	type args struct {
+		sharedPools cephv1.ObjectSharedPoolsSpec
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			name: "no need: both shared pools set",
+			args: args{
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements:                     []cephv1.PoolPlacementSpec{},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "no need: default placement is set",
+			args: args{
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "name",
+							Default:           true,
+							MetadataPoolName:  "", // handled by CRD validation
+							DataPoolName:      "", // handled by CRD validation
+							DataNonECPoolName: "", // handled by CRD validation
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			want: false,
+		},
+		{
+			name: "need: only meta shared pool set",
+			args: args{
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements:                     []cephv1.PoolPlacementSpec{},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "need: only data shared pool set",
+			args: args{
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements:                     []cephv1.PoolPlacementSpec{},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "need: nothing is set",
+			args: args{
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements:                     []cephv1.PoolPlacementSpec{},
+				},
+			},
+			want: true,
+		},
+		{
+			name: "need: no default placement is set",
+			args: args{
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "default",
+							Default:           false,
+							MetadataPoolName:  "", // handled by CRD validation
+							DataPoolName:      "", // handled by CRD validation
+							DataNonECPoolName: "", // handled by CRD validation
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := IsNeedToCreateObjectStorePools(tt.args.sharedPools); got != tt.want {
+				t.Errorf("IsNeedToCreateObjectStorePools() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_getDefaultMetadataPool(t *testing.T) {
+	type args struct {
+		spec cephv1.ObjectSharedPoolsSpec
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "default placement is returned",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "some_name",
+							MetadataPoolName:  "meta1",
+							DataPoolName:      "data1",
+							DataNonECPoolName: "data-non-ec1",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+						{
+							Name:              "some_name_2",
+							Default:           true,
+							MetadataPoolName:  "meta2",
+							DataPoolName:      "data2",
+							DataNonECPoolName: "data-non-ec2",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			want: "meta2",
+		},
+		{
+			name: "default placement override shared pool",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta-shared",
+					DataPoolName:                       "data-shared",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "some_name",
+							MetadataPoolName:  "meta1",
+							DataPoolName:      "data1",
+							DataNonECPoolName: "data-non-ec1",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+						{
+							Name:              "some_name_2",
+							Default:           true,
+							MetadataPoolName:  "meta2",
+							DataPoolName:      "data2",
+							DataNonECPoolName: "data-non-ec2",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			want: "meta2",
+		},
+		{
+			name: "shared pool returned if default placement not set",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta-shared",
+					DataPoolName:                       "data-shared",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "default",
+							Default:           false,
+							MetadataPoolName:  "meta1",
+							DataPoolName:      "data1",
+							DataNonECPoolName: "data-non-ec1",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			want: "meta-shared",
+		},
+		{
+			name: "no pool returned",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "data-shared",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "default",
+							Default:           false,
+							MetadataPoolName:  "meta1",
+							DataPoolName:      "data1",
+							DataNonECPoolName: "data-non-ec1",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			want: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getDefaultMetadataPool(tt.args.spec); got != tt.want {
+				t.Errorf("getDefaultMetadataPool() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_toZonePlacementPool(t *testing.T) {
+	type args struct {
+		spec cephv1.PoolPlacementSpec
+		ns   string
+	}
+	tests := []struct {
+		name string
+		args args
+		want ZonePlacementPool
+	}{
+		{
+			name: "map default placement without non-ec to config",
+			args: args{
+				spec: cephv1.PoolPlacementSpec{
+					Name:              defaultPlacementCephConfigName,
+					Default:           true,
+					MetadataPoolName:  "meta",
+					DataPoolName:      "data",
+					DataNonECPoolName: "",
+					StorageClasses: []cephv1.PlacementStorageClassSpec{
+						{
+							Name:         "REDUCED_REDUNDANCY",
+							DataPoolName: "reduced",
+						},
+					},
+				},
+				ns: "ns",
+			},
+			want: ZonePlacementPool{
+				Key: defaultPlacementCephConfigName,
+				Val: ZonePlacementPoolVal{
+					DataExtraPool: "meta:ns.default-placement.data.non-ec",
+					IndexPool:     "meta:ns.default-placement.index",
+					StorageClasses: map[string]ZonePlacementStorageClass{
+						defaultPlacementStorageClass: {
+							DataPool: "data:ns.default-placement.data",
+						},
+						"REDUCED_REDUNDANCY": {
+							DataPool: "reduced:ns.REDUCED_REDUNDANCY",
+						},
+					},
+					InlineData: true,
+				},
+			},
+		},
+		{
+			name: "map default placement to config",
+			args: args{
+				spec: cephv1.PoolPlacementSpec{
+					Name:              "fast",
+					Default:           true,
+					MetadataPoolName:  "meta",
+					DataPoolName:      "data",
+					DataNonECPoolName: "repl",
+					StorageClasses: []cephv1.PlacementStorageClassSpec{
+						{
+							Name:         "REDUCED_REDUNDANCY",
+							DataPoolName: "reduced",
+						},
+					},
+				},
+				ns: "ns",
+			},
+			want: ZonePlacementPool{
+				Key: "fast",
+				Val: ZonePlacementPoolVal{
+					DataExtraPool: "repl:ns.fast.data.non-ec",
+					IndexPool:     "meta:ns.fast.index",
+					StorageClasses: map[string]ZonePlacementStorageClass{
+						defaultPlacementStorageClass: {
+							DataPool: "data:ns.fast.data",
+						},
+						"REDUCED_REDUNDANCY": {
+							DataPool: "reduced:ns.REDUCED_REDUNDANCY",
+						},
+					},
+					InlineData: true,
+				},
+			},
+		},
+		{
+			name: "map non-default placement without non-ec to config",
+			args: args{
+				spec: cephv1.PoolPlacementSpec{
+					Name:              "placement",
+					Default:           false,
+					MetadataPoolName:  "meta",
+					DataPoolName:      "data",
+					DataNonECPoolName: "",
+					StorageClasses: []cephv1.PlacementStorageClassSpec{
+						{
+							Name:         "REDUCED_REDUNDANCY",
+							DataPoolName: "reduced",
+						},
+					},
+				},
+				ns: "ns",
+			},
+			want: ZonePlacementPool{
+				Key: "placement",
+				Val: ZonePlacementPoolVal{
+					DataExtraPool: "meta:ns.placement.data.non-ec",
+					IndexPool:     "meta:ns.placement.index",
+					StorageClasses: map[string]ZonePlacementStorageClass{
+						defaultPlacementStorageClass: {
+							DataPool: "data:ns.placement.data",
+						},
+						"REDUCED_REDUNDANCY": {
+							DataPool: "reduced:ns.REDUCED_REDUNDANCY",
+						},
+					},
+					InlineData: true,
+				},
+			},
+		},
+		{
+			name: "map non-default placement to config",
+			args: args{
+				spec: cephv1.PoolPlacementSpec{
+					Name:              "placement",
+					Default:           false,
+					MetadataPoolName:  "meta",
+					DataPoolName:      "data",
+					DataNonECPoolName: "repl",
+					StorageClasses: []cephv1.PlacementStorageClassSpec{
+						{
+							Name:         "REDUCED_REDUNDANCY",
+							DataPoolName: "reduced",
+						},
+					},
+				},
+				ns: "ns",
+			},
+			want: ZonePlacementPool{
+				Key: "placement",
+				Val: ZonePlacementPoolVal{
+					DataExtraPool: "repl:ns.placement.data.non-ec",
+					IndexPool:     "meta:ns.placement.index",
+					StorageClasses: map[string]ZonePlacementStorageClass{
+						defaultPlacementStorageClass: {
+							DataPool: "data:ns.placement.data",
+						},
+						"REDUCED_REDUNDANCY": {
+							DataPool: "reduced:ns.REDUCED_REDUNDANCY",
+						},
+					},
+					InlineData: true,
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, toZonePlacementPool(tt.args.spec, tt.args.ns))
+		})
+	}
+}
+
+func Test_toZonePlacementPools(t *testing.T) {
+	type args struct {
+		spec cephv1.ObjectSharedPoolsSpec
+		ns   string
+	}
+	tests := []struct {
+		name string
+		args args
+		want map[string]ZonePlacementPool
+	}{
+		{
+			name: "backward compatible with prev shared pools",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+				},
+				ns: "rgw-instance",
+			},
+			want: map[string]ZonePlacementPool{
+				defaultPlacementCephConfigName: {
+					Key: defaultPlacementCephConfigName,
+					Val: ZonePlacementPoolVal{
+						DataExtraPool: "meta:rgw-instance.buckets.non-ec",
+						IndexPool:     "meta:rgw-instance.buckets.index",
+						StorageClasses: map[string]ZonePlacementStorageClass{
+							"STANDARD": {
+								DataPool: "data:rgw-instance.buckets.data",
+							},
+						},
+						InlineData: true,
+					},
+				},
+			},
+		},
+		{
+			name: "shared pools not removed if default placement set",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "some_name",
+							Default:           true,
+							MetadataPoolName:  "meta1",
+							DataPoolName:      "data1",
+							DataNonECPoolName: "data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "REDUCED_REDUNDANCY",
+									DataPoolName: "reduced",
+								},
+							},
+						},
+					},
+				},
+				ns: "rgw-instance",
+			},
+			want: map[string]ZonePlacementPool{
+				defaultPlacementCephConfigName: {
+					Key: defaultPlacementCephConfigName,
+					Val: ZonePlacementPoolVal{
+						DataExtraPool: "meta:rgw-instance.buckets.non-ec",
+						IndexPool:     "meta:rgw-instance.buckets.index",
+						StorageClasses: map[string]ZonePlacementStorageClass{
+							"STANDARD": {
+								DataPool: "data:rgw-instance.buckets.data",
+							},
+						},
+						InlineData: true,
+					},
+				},
+				"some_name": {
+					Key: "some_name",
+					Val: ZonePlacementPoolVal{
+						DataExtraPool: "data-non-ec:rgw-instance.some_name.data.non-ec",
+						IndexPool:     "meta1:rgw-instance.some_name.index",
+						StorageClasses: map[string]ZonePlacementStorageClass{
+							defaultPlacementStorageClass: {
+								DataPool: "data1:rgw-instance.some_name.data",
+							},
+							"REDUCED_REDUNDANCY": {
+								DataPool: "reduced:rgw-instance.REDUCED_REDUNDANCY",
+							},
+						},
+						InlineData: true,
+					},
+				},
+			},
+		},
+		{
+			name: "no default set",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "meta1",
+							DataPoolName:      "data1",
+							DataNonECPoolName: "data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "REDUCED_REDUNDANCY",
+									DataPoolName: "reduced",
+								},
+							},
+						},
+					},
+				},
+				ns: "rgw-instance",
+			},
+			want: map[string]ZonePlacementPool{
+				"placement": {
+					Key: "placement",
+					Val: ZonePlacementPoolVal{
+						DataExtraPool: "data-non-ec:rgw-instance.placement.data.non-ec",
+						IndexPool:     "meta1:rgw-instance.placement.index",
+						StorageClasses: map[string]ZonePlacementStorageClass{
+							defaultPlacementStorageClass: {
+								DataPool: "data1:rgw-instance.placement.data",
+							},
+							"REDUCED_REDUNDANCY": {
+								DataPool: "reduced:rgw-instance.REDUCED_REDUNDANCY",
+							},
+						},
+						InlineData: true,
+					},
+				},
+			},
+		},
+		{
+			name: "default shared and placement",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "meta1",
+							DataPoolName:      "data1",
+							DataNonECPoolName: "data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "REDUCED_REDUNDANCY",
+									DataPoolName: "reduced",
+								},
+							},
+						},
+					},
+				},
+				ns: "rgw-instance",
+			},
+			want: map[string]ZonePlacementPool{
+				defaultPlacementCephConfigName: {
+					Key: defaultPlacementCephConfigName,
+					Val: ZonePlacementPoolVal{
+						DataExtraPool: "meta:rgw-instance.buckets.non-ec",
+						IndexPool:     "meta:rgw-instance.buckets.index",
+						StorageClasses: map[string]ZonePlacementStorageClass{
+							"STANDARD": {
+								DataPool: "data:rgw-instance.buckets.data",
+							},
+						},
+						InlineData: true,
+					},
+				},
+				"placement": {
+					Key: "placement",
+					Val: ZonePlacementPoolVal{
+						DataExtraPool: "data-non-ec:rgw-instance.placement.data.non-ec",
+						IndexPool:     "meta1:rgw-instance.placement.index",
+						StorageClasses: map[string]ZonePlacementStorageClass{
+							defaultPlacementStorageClass: {
+								DataPool: "data1:rgw-instance.placement.data",
+							},
+							"REDUCED_REDUNDANCY": {
+								DataPool: "reduced:rgw-instance.REDUCED_REDUNDANCY",
+							},
+						},
+						InlineData: true,
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, toZonePlacementPools(tt.args.spec, tt.args.ns))
+		})
+	}
+}
+
+func Test_adjustZoneDefaultPools(t *testing.T) {
+	type args struct {
+		beforeJSON string
+		spec       cephv1.ObjectSharedPoolsSpec
+		// pools present in the cluster. A pool field whose pool exists may hold data and is never re-pointed.
+		existingPools []string
+	}
+	tests := []struct {
+		name        string
+		args        args
+		wantJSON    string
+		wantChanged bool
+		wantErr     bool
+	}{
+		{
+			name: "nothing changed if default shared pool not set",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "DomainRoot",
+    "control_pool": "ControlPool",
+    "gc_pool": "GcPool",
+    "lc_pool": "LcPool",
+    "log_pool": "LogPool",
+    "intent_log_pool": "IntentLogPool",
+    "usage_log_pool": "UsageLogPool",
+    "roles_pool": "RolesPool",
+    "reshard_pool": "ReshardPool",
+    "user_keys_pool": "UserKeysPool",
+    "user_email_pool": "UserEmailPool",
+    "user_swift_pool": "UserSwiftPool",
+    "user_uid_pool": "UserUIDPool",
+    "otp_pool": "OtpPool",
+    "notif_pool": "NotifPool",
+    "system_key": {
+        "access_key": "AccessKey",
+        "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "non-default",
+							MetadataPoolName: "meta",
+							DataPoolName:     "data",
+						},
+					},
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "DomainRoot",
+    "control_pool": "ControlPool",
+    "gc_pool": "GcPool",
+    "lc_pool": "LcPool",
+    "log_pool": "LogPool",
+    "intent_log_pool": "IntentLogPool",
+    "usage_log_pool": "UsageLogPool",
+    "roles_pool": "RolesPool",
+    "reshard_pool": "ReshardPool",
+    "user_keys_pool": "UserKeysPool",
+    "user_email_pool": "UserEmailPool",
+    "user_swift_pool": "UserSwiftPool",
+    "user_uid_pool": "UserUIDPool",
+    "otp_pool": "OtpPool",
+    "notif_pool": "NotifPool",
+    "system_key": {
+        "access_key": "AccessKey",
+        "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "shared pool set",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "DomainRoot",
+    "control_pool": "ControlPool",
+    "gc_pool": "GcPool",
+    "lc_pool": "LcPool",
+    "log_pool": "LogPool",
+    "intent_log_pool": "IntentLogPool",
+    "usage_log_pool": "UsageLogPool",
+    "roles_pool": "RolesPool",
+    "reshard_pool": "ReshardPool",
+    "user_keys_pool": "UserKeysPool",
+    "user_email_pool": "UserEmailPool",
+    "user_swift_pool": "UserSwiftPool",
+    "user_uid_pool": "UserUIDPool",
+    "otp_pool": "OtpPool",
+    "notif_pool": "NotifPool",
+    "system_key": {
+        "access_key": "AccessKey",
+        "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta-pool",
+					DataPoolName:                       "data-pool",
+					PreserveRadosNamespaceDataOnDelete: false,
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "meta-pool:test.meta.root",
+    "control_pool": "meta-pool:test.control",
+    "gc_pool": "meta-pool:test.log.gc",
+    "lc_pool": "meta-pool:test.log.lc",
+    "log_pool": "meta-pool:test.log",
+    "intent_log_pool": "meta-pool:test.log.intent",
+    "usage_log_pool": "meta-pool:test.log.usage",
+    "roles_pool": "meta-pool:test.meta.roles",
+    "reshard_pool": "meta-pool:test.log.reshard",
+    "user_keys_pool": "meta-pool:test.meta.users.keys",
+    "user_email_pool": "meta-pool:test.meta.users.email",
+    "user_swift_pool": "meta-pool:test.meta.users.swift",
+    "user_uid_pool": "meta-pool:test.meta.users.uid",
+    "otp_pool": "meta-pool:test.otp",
+    "notif_pool": "meta-pool:test.log.notif",
+    "system_key": {
+      "access_key": "AccessKey",
+      "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "config equals to spec: no changes needed",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "meta-pool:test.meta.root",
+    "control_pool": "meta-pool:test.control",
+    "gc_pool": "meta-pool:test.log.gc",
+    "lc_pool": "meta-pool:test.log.lc",
+    "log_pool": "meta-pool:test.log",
+    "intent_log_pool": "meta-pool:test.log.intent",
+    "usage_log_pool": "meta-pool:test.log.usage",
+    "roles_pool": "meta-pool:test.meta.roles",
+    "reshard_pool": "meta-pool:test.log.reshard",
+    "user_keys_pool": "meta-pool:test.meta.users.keys",
+    "user_email_pool": "meta-pool:test.meta.users.email",
+    "user_swift_pool": "meta-pool:test.meta.users.swift",
+    "user_uid_pool": "meta-pool:test.meta.users.uid",
+    "otp_pool": "meta-pool:test.otp",
+    "notif_pool": "meta-pool:test.log.notif",
+    "system_key": {
+      "access_key": "AccessKey",
+      "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta-pool",
+					DataPoolName:                       "data-pool",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements:                     []cephv1.PoolPlacementSpec{},
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "meta-pool:test.meta.root",
+    "control_pool": "meta-pool:test.control",
+    "gc_pool": "meta-pool:test.log.gc",
+    "lc_pool": "meta-pool:test.log.lc",
+    "log_pool": "meta-pool:test.log",
+    "intent_log_pool": "meta-pool:test.log.intent",
+    "usage_log_pool": "meta-pool:test.log.usage",
+    "roles_pool": "meta-pool:test.meta.roles",
+    "reshard_pool": "meta-pool:test.log.reshard",
+    "user_keys_pool": "meta-pool:test.meta.users.keys",
+    "user_email_pool": "meta-pool:test.meta.users.email",
+    "user_swift_pool": "meta-pool:test.meta.users.swift",
+    "user_uid_pool": "meta-pool:test.meta.users.uid",
+    "otp_pool": "meta-pool:test.otp",
+    "notif_pool": "meta-pool:test.log.notif",
+    "system_key": {
+      "access_key": "AccessKey",
+      "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}
+`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "default placement pool overrides shared pool",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "DomainRoot",
+    "control_pool": "ControlPool",
+    "gc_pool": "GcPool",
+    "lc_pool": "LcPool",
+    "log_pool": "LogPool",
+    "intent_log_pool": "IntentLogPool",
+    "usage_log_pool": "UsageLogPool",
+    "roles_pool": "RolesPool",
+    "reshard_pool": "ReshardPool",
+    "user_keys_pool": "UserKeysPool",
+    "user_email_pool": "UserEmailPool",
+    "user_swift_pool": "UserSwiftPool",
+    "user_uid_pool": "UserUIDPool",
+    "otp_pool": "OtpPool",
+    "notif_pool": "NotifPool",
+    "system_key": {
+        "access_key": "AccessKey",
+        "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "shared-meta-pool",
+					DataPoolName:                       "shared-data-pool",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "some_name",
+							Default:          true,
+							MetadataPoolName: "meta-pool",
+							DataPoolName:     "data-pool",
+						},
+					},
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "meta-pool:test.meta.root",
+    "control_pool": "meta-pool:test.control",
+    "gc_pool": "meta-pool:test.log.gc",
+    "lc_pool": "meta-pool:test.log.lc",
+    "log_pool": "meta-pool:test.log",
+    "intent_log_pool": "meta-pool:test.log.intent",
+    "usage_log_pool": "meta-pool:test.log.usage",
+    "roles_pool": "meta-pool:test.meta.roles",
+    "reshard_pool": "meta-pool:test.log.reshard",
+    "user_keys_pool": "meta-pool:test.meta.users.keys",
+    "user_email_pool": "meta-pool:test.meta.users.email",
+    "user_swift_pool": "meta-pool:test.meta.users.swift",
+    "user_uid_pool": "meta-pool:test.meta.users.uid",
+    "otp_pool": "meta-pool:test.otp",
+    "notif_pool": "meta-pool:test.log.notif",
+    "system_key": {
+      "access_key": "AccessKey",
+      "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "v19 shared pool set",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "topics_pool": "TopicsPool",
+    "account_pool": "AccountPool",
+    "group_pool": "GroupPool",
+    "domain_root": "DomainRoot",
+    "control_pool": "ControlPool",
+    "gc_pool": "GcPool",
+    "lc_pool": "LcPool",
+    "log_pool": "LogPool",
+    "intent_log_pool": "IntentLogPool",
+    "usage_log_pool": "UsageLogPool",
+    "roles_pool": "RolesPool",
+    "reshard_pool": "ReshardPool",
+    "user_keys_pool": "UserKeysPool",
+    "user_email_pool": "UserEmailPool",
+    "user_swift_pool": "UserSwiftPool",
+    "user_uid_pool": "UserUIDPool",
+    "otp_pool": "OtpPool",
+    "notif_pool": "NotifPool",
+    "system_key": {
+        "access_key": "AccessKey",
+        "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta-pool",
+					DataPoolName:                       "data-pool",
+					PreserveRadosNamespaceDataOnDelete: false,
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "topics_pool": "meta-pool:test.meta.topics",
+    "account_pool": "meta-pool:test.meta.account",
+    "group_pool": "meta-pool:test.meta.group",
+    "domain_root": "meta-pool:test.meta.root",
+    "control_pool": "meta-pool:test.control",
+    "gc_pool": "meta-pool:test.log.gc",
+    "lc_pool": "meta-pool:test.log.lc",
+    "log_pool": "meta-pool:test.log",
+    "intent_log_pool": "meta-pool:test.log.intent",
+    "usage_log_pool": "meta-pool:test.log.usage",
+    "roles_pool": "meta-pool:test.meta.roles",
+    "reshard_pool": "meta-pool:test.log.reshard",
+    "user_keys_pool": "meta-pool:test.meta.users.keys",
+    "user_email_pool": "meta-pool:test.meta.users.email",
+    "user_swift_pool": "meta-pool:test.meta.users.swift",
+    "user_uid_pool": "meta-pool:test.meta.users.uid",
+    "otp_pool": "meta-pool:test.otp",
+    "notif_pool": "meta-pool:test.log.notif",
+    "system_key": {
+      "access_key": "AccessKey",
+      "secret_key": "SecretKey"
+    },
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "system pools stay on their pool when the default placement moves and the pool exists",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "p1-meta:test.meta.root",
+    "control_pool": "p1-meta:test.control",
+    "gc_pool": "p1-meta:test.log.gc",
+    "lc_pool": "p1-meta:test.log.lc",
+    "log_pool": "p1-meta:test.log",
+    "intent_log_pool": "p1-meta:test.log.intent",
+    "usage_log_pool": "p1-meta:test.log.usage",
+    "roles_pool": "p1-meta:test.meta.roles",
+    "reshard_pool": "p1-meta:test.log.reshard",
+    "user_keys_pool": "p1-meta:test.meta.users.keys",
+    "user_email_pool": "p1-meta:test.meta.users.email",
+    "user_swift_pool": "p1-meta:test.meta.users.swift",
+    "user_uid_pool": "p1-meta:test.meta.users.uid",
+    "otp_pool": "p1-meta:test.otp",
+    "notif_pool": "p1-meta:test.log.notif",
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{Name: "p1", MetadataPoolName: "p1-meta", DataPoolName: "p1-data"},
+						{Name: "p2", Default: true, MetadataPoolName: "p2-meta", DataPoolName: "p2-data"},
+					},
+				},
+				existingPools: []string{"p1-meta", "p1-data", "p2-meta", "p2-data"},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "p1-meta:test.meta.root",
+    "control_pool": "p1-meta:test.control",
+    "gc_pool": "p1-meta:test.log.gc",
+    "lc_pool": "p1-meta:test.log.lc",
+    "log_pool": "p1-meta:test.log",
+    "intent_log_pool": "p1-meta:test.log.intent",
+    "usage_log_pool": "p1-meta:test.log.usage",
+    "roles_pool": "p1-meta:test.meta.roles",
+    "reshard_pool": "p1-meta:test.log.reshard",
+    "user_keys_pool": "p1-meta:test.meta.users.keys",
+    "user_email_pool": "p1-meta:test.meta.users.email",
+    "user_swift_pool": "p1-meta:test.meta.users.swift",
+    "user_uid_pool": "p1-meta:test.meta.users.uid",
+    "otp_pool": "p1-meta:test.otp",
+    "notif_pool": "p1-meta:test.log.notif",
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "plain store adopting shared pools keeps system pools on the store's own pools",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "test.rgw.meta:root",
+    "control_pool": "test.rgw.control",
+    "gc_pool": "test.rgw.log:gc",
+    "log_pool": "test.rgw.log",
+    "user_keys_pool": "test.rgw.meta:users.keys",
+    "otp_pool": "test.rgw.otp",
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{Name: "p1", Default: true, MetadataPoolName: "p1-meta", DataPoolName: "p1-data"},
+					},
+				},
+				existingPools: []string{"test.rgw.meta", "test.rgw.control", "test.rgw.log", "test.rgw.otp", "p1-meta", "p1-data"},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "test.rgw.meta:root",
+    "control_pool": "test.rgw.control",
+    "gc_pool": "test.rgw.log:gc",
+    "log_pool": "test.rgw.log",
+    "user_keys_pool": "test.rgw.meta:users.keys",
+    "otp_pool": "test.rgw.otp",
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "fresh zone: ceph bootstrap system pools do not exist and are replaced by the default placement pool",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "test.rgw.meta:root",
+    "control_pool": "test.rgw.control",
+    "gc_pool": "test.rgw.log:gc",
+    "log_pool": "test.rgw.log",
+    "user_keys_pool": "test.rgw.meta:users.keys",
+    "otp_pool": "test.rgw.otp",
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{Name: "p1", Default: true, MetadataPoolName: "p1-meta", DataPoolName: "p1-data"},
+					},
+				},
+				existingPools: []string{"p1-meta", "p1-data"},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "p1-meta:test.meta.root",
+    "control_pool": "p1-meta:test.control",
+    "gc_pool": "p1-meta:test.log.gc",
+    "log_pool": "p1-meta:test.log",
+    "user_keys_pool": "p1-meta:test.meta.users.keys",
+    "otp_pool": "p1-meta:test.otp",
+    "placement_pools": [],
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd"
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srcZone := map[string]any{}
+			err := json.Unmarshal([]byte(tt.args.beforeJSON), &srcZone)
+			assert.NoError(t, err)
+			changedZone, err := adjustZoneDefaultPools(testNsName, srcZone, tt.args.spec, sets.New(tt.args.existingPools...))
+
+			// check that source was not modified
+			orig := map[string]any{}
+			jErr := json.Unmarshal([]byte(tt.args.beforeJSON), &orig)
+			assert.NoError(t, jErr)
+			assert.EqualValues(t, orig, srcZone, "src was not modified")
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantChanged, !reflect.DeepEqual(srcZone, changedZone))
+			bytes, err := json.Marshal(&changedZone)
+			assert.NoError(t, err)
+			assert.JSONEq(t, tt.wantJSON, string(bytes))
+		})
+	}
+}
+
+func Test_adjustZonePlacementPools(t *testing.T) {
+	type args struct {
+		beforeJSON string
+		spec       cephv1.ObjectSharedPoolsSpec
+		// pools present in the cluster. A placement whose pools exist may hold buckets and is immutable.
+		existingPools []string
+	}
+	tests := []struct {
+		name        string
+		args        args
+		wantJSON    string
+		wantChanged bool
+		wantErr     bool
+		// substrings the error message must contain when wantErr is set
+		wantErrContains []string
+	}{
+		{
+			name: "no changes: shared spec not set",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 0,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 0,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "no changes: spec equal to config",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "meta-pool:test.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "data-pool:test.buckets.data"
+                    }
+                },
+                "data_extra_pool": "meta-pool:test.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName: "meta-pool",
+					DataPoolName:     "data-pool",
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "meta-pool:test.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "data-pool:test.buckets.data"
+                    }
+                },
+                "data_extra_pool": "meta-pool:test.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "default placement is preserved when non-default placement added",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{{
+						Name:              "fast",
+						MetadataPoolName:  "fast-meta",
+						DataPoolName:      "fast-data",
+						DataNonECPoolName: "fast-non-ec",
+						StorageClasses: []cephv1.PlacementStorageClassSpec{
+							{
+								Name:         "REDUCED_REDUNDANCY",
+								DataPoolName: "reduced",
+							},
+						},
+					}},
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "fast",
+            "val": {
+                "index_pool": "fast-meta:test.fast.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "fast-data:test.fast.data"
+                    },
+                    "REDUCED_REDUNDANCY": {
+                        "data_pool": "reduced:test.REDUCED_REDUNDANCY"
+                    }
+                },
+                "data_extra_pool": "fast-non-ec:test.fast.data.non-ec",
+                "inline_data": true
+            }
+        }
+
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "delete placement",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "fast",
+            "val": {
+                "index_pool": "fast-meta:test.fast.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "fast-data:test.fast.data"
+                    }
+                },
+                "data_extra_pool": "fast-non-ec:test.fast.data.non-ec",
+                "index_type": 0,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "slow",
+            "val": {
+                "index_pool": "slow-meta:test.slow.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "slow-data:test.slow.data"
+                    }
+                },
+                "data_extra_pool": "slow-non-ec:test.slow.data.non-ec",
+                "index_type": 0,
+                "inline_data": false
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "slow",
+							MetadataPoolName:  "slow-meta",
+							DataPoolName:      "slow-data",
+							DataNonECPoolName: "slow-non-ec",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "slow",
+            "val": {
+                "index_pool": "slow-meta:test.slow.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "slow-data:test.slow.data"
+                    }
+                },
+                "data_extra_pool": "slow-non-ec:test.slow.data.non-ec",
+                "index_type": 0,
+                "inline_data": false
+            }
+        }
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "sharedPools placement not removed if default set",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta-pool",
+					DataPoolName:                       "data-pool",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "slow",
+							Default:           true,
+							MetadataPoolName:  "slow-meta",
+							DataPoolName:      "slow-data",
+							DataNonECPoolName: "slow-non-ec",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "meta-pool:test.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "data-pool:test.buckets.data"
+                    }
+                },
+                "data_extra_pool": "meta-pool:test.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "slow",
+            "val": {
+                "index_pool": "slow-meta:test.slow.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "slow-data:test.slow.data"
+                    }
+                },
+                "data_extra_pool": "slow-non-ec:test.slow.data.non-ec",
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "if sharedPools not set and default placement is set, then default placements values are copied to 'default-placement'",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "slow",
+							Default:           true,
+							MetadataPoolName:  "slow-meta",
+							DataPoolName:      "slow-data",
+							DataNonECPoolName: "slow-non-ec",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "slow-meta:test.slow.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "slow-data:test.slow.data"
+                    }
+                },
+                "data_extra_pool": "slow-non-ec:test.slow.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "slow",
+            "val": {
+                "index_pool": "slow-meta:test.slow.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "slow-data:test.slow.data"
+                    }
+                },
+                "data_extra_pool": "slow-non-ec:test.slow.data.non-ec",
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "'default-placement' is initialized from default placement while its own pools do not exist, even if the default placement's pools exist",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "slow",
+							Default:          true,
+							MetadataPoolName: "slow-meta",
+							DataPoolName:     "slow-data",
+						},
+					},
+				},
+				existingPools: []string{"slow-meta", "slow-data"},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "slow-meta:test.slow.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "slow-data:test.slow.data"
+                    }
+                },
+                "data_extra_pool": "slow-meta:test.slow.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "slow",
+            "val": {
+                "index_pool": "slow-meta:test.slow.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "slow-data:test.slow.data"
+                    }
+                },
+                "data_extra_pool": "slow-meta:test.slow.data.non-ec",
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "'default-placement' is not re-pointed when default moves to another placement and its pools exist",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p2",
+            "val": {
+                "index_pool": "p2-meta:test.p2.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p2-data:test.p2.data"
+                    }
+                },
+                "data_extra_pool": "p2-meta:test.p2.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "p1",
+							MetadataPoolName: "p1-meta",
+							DataPoolName:     "p1-data",
+						},
+						{
+							Name:             "p2",
+							Default:          true,
+							MetadataPoolName: "p2-meta",
+							DataPoolName:     "p2-data",
+						},
+					},
+				},
+				existingPools: []string{"p1-meta", "p1-data", "p2-meta", "p2-data"},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p2",
+            "val": {
+                "index_pool": "p2-meta:test.p2.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p2-data:test.p2.data"
+                    }
+                },
+                "data_extra_pool": "p2-meta:test.p2.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "'default-placement' keeps the store's own pools when a default placement is introduced and those pools exist",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "p1",
+							Default:          true,
+							MetadataPoolName: "p1-meta",
+							DataPoolName:     "p1-data",
+						},
+					},
+				},
+				existingPools: []string{"test.rgw.buckets.index", "test.rgw.buckets.data", "test.rgw.buckets.non-ec", "p1-meta", "p1-data"},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "error: pools of an existing placement cannot be changed",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "p1",
+							MetadataPoolName: "p1-meta",
+							DataPoolName:     "other-data",
+						},
+					},
+				},
+				existingPools: []string{"p1-meta", "p1-data", "other-data"},
+			},
+			wantErr:         true,
+			wantErrContains: []string{"invalidObjStorePoolConfig", `placement "p1"`, `"p1-data:test.p1.data"`, `"other-data:test.p1.data"`},
+		},
+		{
+			name: "pools of a placement whose pools do not exist can be changed",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "p1",
+							MetadataPoolName: "p1-meta",
+							DataPoolName:     "other-data",
+						},
+					},
+				},
+				existingPools: []string{"other-data"},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "other-data:test.p1.data"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "storage class can be added to and removed from an existing placement",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    },
+                    "OLD": {
+                        "data_pool": "p1-old:test.OLD"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "p1",
+							MetadataPoolName: "p1-meta",
+							DataPoolName:     "p1-data",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{Name: "COLD", DataPoolName: "p1-cold"},
+							},
+						},
+					},
+				},
+				existingPools: []string{"p1-meta", "p1-data", "p1-old", "p1-cold"},
+			},
+			wantJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    },
+                    "COLD": {
+                        "data_pool": "p1-cold:test.COLD"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "error: data pool of an existing storage class cannot be changed",
+			args: args{
+				beforeJSON: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "p1",
+            "val": {
+                "index_pool": "p1-meta:test.p1.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "p1-data:test.p1.data"
+                    },
+                    "COLD": {
+                        "data_pool": "p1-cold:test.COLD"
+                    }
+                },
+                "data_extra_pool": "p1-meta:test.p1.data.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:             "p1",
+							MetadataPoolName: "p1-meta",
+							DataPoolName:     "p1-data",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{Name: "COLD", DataPoolName: "p1-colder"},
+							},
+						},
+					},
+				},
+				existingPools: []string{"p1-meta", "p1-data", "p1-cold", "p1-colder"},
+			},
+			wantErr:         true,
+			wantErrContains: []string{"invalidObjStorePoolConfig", `placement "p1"`, `storage class "COLD"`, `"p1-cold:test.COLD"`, `"p1-colder:test.COLD"`},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srcZone := map[string]any{}
+			err := json.Unmarshal([]byte(tt.args.beforeJSON), &srcZone)
+			assert.NoError(t, err)
+			changedZone, err := adjustZonePlacementPools(testNsName, srcZone, tt.args.spec, sets.New(tt.args.existingPools...))
+			// check that source zone was not modified:
+			orig := map[string]any{}
+			jErr := json.Unmarshal([]byte(tt.args.beforeJSON), &orig)
+			assert.NoError(t, jErr)
+			assert.EqualValues(t, srcZone, orig, "source obj was not modified")
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				for _, want := range tt.wantErrContains {
+					assert.ErrorContains(t, err, want)
+				}
+				return
+			} else {
+				assert.NoError(t, err)
+			}
+			bytes, err := json.Marshal(&changedZone)
+			assert.NoError(t, err)
+			assert.JSONEq(t, tt.wantJSON, string(bytes))
+
+			assert.EqualValues(t, tt.wantChanged, !reflect.DeepEqual(srcZone, changedZone))
+		})
+	}
+}
+
+func Test_adjustZoneGroupPlacementTargets(t *testing.T) {
+	type args struct {
+		zone             string
+		groupBefore      string
+		defaultPlacement string
+	}
+	tests := []struct {
+		name        string
+		args        args
+		wantGroup   string
+		wantChanged bool
+		wantErr     bool
+	}{
+		{
+			name: "nothing changed",
+			args: args{
+				defaultPlacement: defaultPlacementCephConfigName,
+				groupBefore: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+				zone: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			},
+			wantGroup: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+			wantChanged: false,
+			wantErr:     false,
+		},
+		{
+			name: "default changed",
+			args: args{
+				defaultPlacement: defaultPlacementCephConfigName,
+				groupBefore: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "some-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+				zone: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			},
+			wantGroup: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "storage class added",
+			args: args{
+				defaultPlacement: defaultPlacementCephConfigName,
+				groupBefore: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+				zone: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    },
+                    "REDUCED_REDUNDANCY": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			},
+			wantGroup: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "REDUCED_REDUNDANCY","STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "placement added",
+			args: args{
+				defaultPlacement: defaultPlacementCephConfigName,
+				groupBefore: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+				zone: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    },
+                    "REDUCED_REDUNDANCY": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec"
+            }
+        },
+        {
+            "key": "slow",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec"
+            }
+        }
+    ]
+}`,
+			},
+			wantGroup: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "REDUCED_REDUNDANCY","STANDARD"
+            ]
+        },
+        {
+            "name": "slow",
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+		{
+			name: "placement and sc removed",
+			args: args{
+				defaultPlacement: defaultPlacementCephConfigName,
+				groupBefore: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "REDUCED_REDUNDANCY","STANDARD"
+            ]
+        },
+        {
+            "name": "slow",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+				zone: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec"
+            }
+        }
+    ]
+}`,
+			},
+			wantGroup: `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "test",
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "enabled_features": [
+        "resharding"
+    ]
+}`,
+			wantChanged: true,
+			wantErr:     false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			zj := map[string]any{}
+			err := json.Unmarshal([]byte(tt.args.zone), &zj)
+			assert.NoError(t, err)
+			srcGroup := map[string]any{}
+			err = json.Unmarshal([]byte(tt.args.groupBefore), &srcGroup)
+			assert.NoError(t, err)
+			changedGroup, err := adjustZoneGroupPlacementTargets(srcGroup, zj, tt.args.defaultPlacement)
+
+			orig := map[string]any{}
+			jErr := json.Unmarshal([]byte(tt.args.groupBefore), &orig)
+			assert.NoError(t, jErr)
+			assert.EqualValues(t, orig, srcGroup, "src was not modified")
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				return
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantChanged, !reflect.DeepEqual(srcGroup, changedGroup))
+			bytes, err := json.Marshal(changedGroup)
+			assert.NoError(t, err)
+			assert.JSONEq(t, tt.wantGroup, string(bytes))
+		})
+	}
+}
+
+func Test_createPlacementTargetsFromZonePoolPlacements(t *testing.T) {
+	type args struct {
+		zone string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    map[string]ZonegroupPlacementTarget
+		wantErr bool
+	}{
+		{
+			name: "",
+			args: args{
+				zone: `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "placement_pools": [
+        {
+            "key": "default-placement",
+            "val": {
+                "index_pool": "test.rgw.buckets.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "test.rgw.buckets.data"
+                    },
+                    "REDUCED_REDUNDANCY": {
+                        "data_pool": "test.rgw.buckets.data"
+                    }
+                },
+                "data_extra_pool": "test.rgw.buckets.non-ec",
+                "index_type": 5,
+                "inline_data": true
+            }
+        },
+        {
+            "key": "slow",
+            "val": {
+                "index_pool": "slow-meta:test.slow.index",
+                "storage_classes": {
+                    "STANDARD": {
+                        "data_pool": "slow-data:test.slow.data"
+                    }
+                },
+                "data_extra_pool": "slow-non-ec:test.slow.data.non-ec",
+                "index_type": 0,
+                "inline_data": true
+            }
+        }
+    ]
+}`,
+			},
+			want: map[string]ZonegroupPlacementTarget{
+				"default-placement": {
+					Name:           "default-placement",
+					StorageClasses: []string{"REDUCED_REDUNDANCY", "STANDARD"},
+				},
+				"slow": {
+					Name:           "slow",
+					StorageClasses: []string{"STANDARD"},
+				},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			zo := map[string]any{}
+			_ = json.Unmarshal([]byte(tt.args.zone), &zo)
+			got, err := createPlacementTargetsFromZonePoolPlacements(zo)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("createPlacementTargetsFromZonePoolPlacements() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("createPlacementTargetsFromZonePoolPlacements() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_getDefaultPlacementName(t *testing.T) {
+	type args struct {
+		spec cephv1.ObjectSharedPoolsSpec
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: "no default placement set in spec",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:    "one",
+							Default: false,
+						},
+						{
+							Name:    "two",
+							Default: false,
+						},
+					},
+				},
+			},
+			want: defaultPlacementCephConfigName,
+		},
+		{
+			name: "first placement set as defaultu in spec",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:    "one",
+							Default: true,
+						},
+						{
+							Name:    "two",
+							Default: false,
+						},
+					},
+				},
+			},
+			want: "one",
+		},
+		{
+			name: "second placement set as default in spec",
+			args: args{
+				spec: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:    "one",
+							Default: false,
+						},
+						{
+							Name:    "two",
+							Default: true,
+						},
+					},
+				},
+			},
+			want: "two",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := getDefaultPlacementName(tt.args.spec); got != tt.want {
+				t.Errorf("getDefaultPlacementName() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// zoneContextForTest returns an object Context whose radosgw-admin calls all answer with
+// response, and whose config file writes land in a directory the test owns.
+func zoneContextForTest(t *testing.T, response string) *Context {
+	t.Helper()
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			return response, nil
+		},
+	}
+	return &Context{
+		Context:     &clusterd.Context{Executor: executor, ConfigDir: t.TempDir()},
+		clusterInfo: client.AdminTestClusterInfo("rook"),
+		Name:        "test",
+		Realm:       "realm-a",
+		ZoneGroup:   "zonegroup-a",
+		Zone:        "test",
+	}
+}
+
+func TestGetZoneJSONFiltersTheLoggedDocument(t *testing.T) {
+	// 'zone get' answers with the realm system user's live S3 credentials, and with whatever
+	// else the running Ceph puts in a zone document. The response stays in the debug log,
+	// filtered to the fields rook reads, because those fields are what the line is for.
+	logBuf := captureLogsAtLevel(t, capnslog.DEBUG)
+
+	zone, err := getZoneJSON(zoneContextForTest(t, testZoneJSON))
+	require.NoError(t, err)
+
+	// the caller still receives the whole document; it feeds it back to 'zone set'
+	systemKey, ok := zone["system_key"].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, testZoneAccessKey, systemKey["access_key"])
+
+	logged := logBuf.String()
+	assert.NotContains(t, logged, testZoneAccessKey)
+	assert.NotContains(t, logged, testZoneSecretKey)
+	assert.NotContains(t, logged, testTierSecret)
+	assert.NotContains(t, logged, testUnknownSecret)
+	assert.NotContains(t, logged, testNestedSecret)
+
+	// filtered, not suppressed: the line and the fields rook reads are still there
+	assert.Contains(t, logged, "get zone success")
+	assert.Contains(t, logged, "test.rgw.meta:root")
+	assert.Contains(t, logged, "test.rgw.buckets.index")
+	assert.Contains(t, logged, "29e28253-be54-4581-90dd-206020d2fcdd")
+	// and the line says the document had more in it than the log shows
+	assert.Contains(t, logged, withheldMarker)
+}
+
+func TestUpdateZoneJSONFiltersBothLoggedDocuments(t *testing.T) {
+	// both the document fed to 'zone set' and the document it answers with carry the realm
+	// system user's credentials - the same credentials the config file is written 0600 to
+	// protect
+	const setResponse = `{
+    "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "name": "test",
+    "domain_root": "test.rgw.meta:root",
+    "system_key": {
+        "access_key": "` + testZoneAccessKey + `",
+        "secret_key": "` + testZoneSecretKey + `"
+    },
+    "placement_pools": [],
+    "realm_id": "11111111-2222-4333-8444-555555555555"
+}`
+
+	logBuf := captureLogsAtLevel(t, capnslog.DEBUG)
+
+	zone := map[string]any{}
+	require.NoError(t, json.Unmarshal([]byte(testZoneJSON), &zone))
+
+	updated, err := updateZoneJSON(zoneContextForTest(t, setResponse), zone)
+	require.NoError(t, err)
+	assert.Equal(t, "test", updated["name"])
+
+	logged := logBuf.String()
+	assert.NotContains(t, logged, testZoneAccessKey)
+	assert.NotContains(t, logged, testZoneSecretKey)
+	assert.NotContains(t, logged, testTierSecret)
+	assert.NotContains(t, logged, testUnknownSecret)
+	assert.NotContains(t, logged, testNestedSecret)
+
+	// filtered, not suppressed, on both sides of the update
+	assert.Contains(t, logged, "json config updated value from")
+	assert.Contains(t, logged, "test.rgw.buckets.index")
+	assert.Contains(t, logged, "11111111-2222-4333-8444-555555555555")
+}
+
+func TestUpdateZoneJSONFiltersUndecodableSetResponse(t *testing.T) {
+	// a truncated 'zone set' response must not reach the log raw on its way to the unmarshal
+	// error the caller reports
+	setResponse := `{"name": "test", "system_key": {"secret_key": "` + testZoneSecretKey
+
+	logBuf := captureLogsAtLevel(t, capnslog.DEBUG)
+
+	zone := map[string]any{}
+	require.NoError(t, json.Unmarshal([]byte(testZoneJSON), &zone))
+
+	_, err := updateZoneJSON(zoneContextForTest(t, setResponse), zone)
+	require.Error(t, err)
+
+	logged := logBuf.String()
+	assert.NotContains(t, logged, testZoneAccessKey)
+	assert.NotContains(t, logged, testZoneSecretKey)
+	assert.NotContains(t, logged, testZoneSecretKey[:10])
+}

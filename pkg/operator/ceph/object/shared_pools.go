@@ -1,0 +1,672 @@
+package object
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path"
+	"sort"
+	"strings"
+
+	"github.com/coreos/pkg/capnslog"
+	"github.com/pkg/errors"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/util/log"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
+)
+
+const (
+	defaultPlacementCephConfigName = "default-placement"
+	defaultPlacementStorageClass   = "STANDARD"
+)
+
+func IsNeedToCreateObjectStorePools(sharedPools cephv1.ObjectSharedPoolsSpec) bool {
+	for _, pp := range sharedPools.PoolPlacements {
+		if pp.Default {
+			// No need to create pools. External pools from default placement will be used
+			return false
+		}
+	}
+	if sharedPools.MetadataPoolName != "" && sharedPools.DataPoolName != "" {
+		// No need to create pools. Shared pools will be used
+		return false
+	}
+	return true
+}
+
+func validatePoolPlacements(placements []cephv1.PoolPlacementSpec) error {
+	hasDefault := false
+	names := make(map[string]struct{}, len(placements))
+	for _, p := range placements {
+		if hasDefault && p.Default {
+			return fmt.Errorf("invalidObjStorePoolConfig: only one placement can be set as default")
+		}
+		hasDefault = hasDefault || p.Default
+
+		if _, ok := names[p.Name]; ok {
+			return fmt.Errorf("invalidObjStorePoolConfig: invalid placement %s: placement names must be unique", p.Name)
+		}
+
+		if p.Name == defaultPlacementCephConfigName && !p.Default {
+			return fmt.Errorf("invalidObjStorePoolConfig: placement with name %s must be marked as default", defaultPlacementCephConfigName)
+		}
+
+		names[p.Name] = struct{}{}
+		if err := validatePoolPlacementStorageClasses(p.StorageClasses); err != nil {
+			return fmt.Errorf("invalidObjStorePoolConfig: invalid placement %s: %w", p.Name, err)
+		}
+	}
+	return nil
+}
+
+func validatePoolPlacementStorageClasses(scList []cephv1.PlacementStorageClassSpec) error {
+	names := make(map[string]struct{}, len(scList))
+	for _, sc := range scList {
+		if sc.Name == defaultPlacementStorageClass {
+			return fmt.Errorf("invalid placement StorageClass %q: %q name is reserved", sc.Name, defaultPlacementStorageClass)
+		}
+		if _, ok := names[sc.Name]; ok {
+			return fmt.Errorf("invalid placement StorageClass %q: name must be unique", sc.Name)
+		}
+		names[sc.Name] = struct{}{}
+	}
+	return nil
+}
+
+// adjustZonePlacementPools adds and removes zone placement_pools entries and storage classes to match
+// the spec. Pool references of an existing placement are immutable once any of its pools exists in
+// the cluster (existingPools): buckets are addressed by placement name, so re-pointing would make
+// their data unreachable. A spec that changes such pools is rejected with an error.
+//
+// 'default-placement' cannot be removed (https://tracker.ceph.com/issues/68775). When it is not in
+// the spec it is set once, on a fresh zone, to the pools of the placement marked default, and kept
+// as is afterwards. Which placement is default is tracked only by the zonegroup's default_placement,
+// see adjustZoneGroupPlacementTargets.
+func adjustZonePlacementPools(nsName types.NamespacedName, zone map[string]any, spec cephv1.ObjectSharedPoolsSpec, existingPools sets.Set[string]) (map[string]any, error) {
+	name, err := getObjProperty[string](zone, "name")
+	if err != nil {
+		return nil, fmt.Errorf("unable to get zone name: %w", err)
+	}
+
+	// deep copy source zone
+	zone, err = deepCopyJson(zone)
+	if err != nil {
+		return nil, fmt.Errorf("unable to deep copy config for zone %s: %w", name, err)
+	}
+
+	placements, err := getObjProperty[[]any](zone, "placement_pools")
+	if err != nil {
+		return nil, fmt.Errorf("unable to get pool placements for zone %s: %w", name, err)
+	}
+
+	fromSpec := toZonePlacementPools(spec, name)
+
+	inConfig := map[string]struct{}{}
+	idxToRemove := map[int]struct{}{}
+	for i, p := range placements {
+		pObj, ok := p.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("unable to cast pool placement to object for zone %s: %+v", name, p)
+		}
+		placementID, err := getObjProperty[string](pObj, "key")
+		if err != nil {
+			return nil, fmt.Errorf("unable to get pool placement name for zone %s: %w", name, err)
+		}
+		if _, inSpec := fromSpec[placementID]; !inSpec && placementID != defaultPlacementCephConfigName {
+			// remove placement if it is not in spec
+			idxToRemove[i] = struct{}{}
+			continue
+		}
+
+		fromZone, err := parseZonePlacementPoolVal(pObj)
+		if err != nil {
+			return nil, fmt.Errorf("unable to parse pool placement %q for zone %q: %w", placementID, name, err)
+		}
+		update, updateNeeded, err := getPlacementUpdate(placementID, fromZone, fromZone.poolsExist(existingPools), fromSpec, getDefaultPlacementName(spec))
+		if err != nil {
+			return nil, fmt.Errorf("invalidObjStorePoolConfig: zone %q placement %q: %w", name, placementID, err)
+		}
+		if !updateNeeded {
+			log.NamedDebug(nsName, logger, "zone %q placement %q stays on its pools %v", name, placementID, fromZone.pools())
+			inConfig[placementID] = struct{}{}
+			continue
+		}
+
+		// update placement with values from spec:
+		_, err = updateObjProperty(pObj, update.IndexPool, "val", "index_pool")
+		if err != nil {
+			return nil, fmt.Errorf("unable to set index pool to pool placement %q for zone %q: %w", placementID, name, err)
+		}
+		_, err = updateObjProperty(pObj, update.DataExtraPool, "val", "data_extra_pool")
+		if err != nil {
+			return nil, fmt.Errorf("unable to set data extra pool to pool placement %q for zone %q: %w", placementID, name, err)
+		}
+		scObj, err := toObj(update.StorageClasses)
+		if err != nil {
+			return nil, fmt.Errorf("unable convert to pool placement %q storage class for zone %q: %w", placementID, name, err)
+		}
+
+		_, err = updateObjProperty(pObj, scObj, "val", "storage_classes")
+		if err != nil {
+			return nil, fmt.Errorf("unable to set storage classes to pool placement %q for zone %q: %w", placementID, name, err)
+		}
+		inConfig[placementID] = struct{}{}
+	}
+	if len(idxToRemove) != 0 {
+		// delete placements from slice
+		updated := make([]any, 0, len(placements)-len(idxToRemove))
+		for i := range placements {
+			if _, ok := idxToRemove[i]; ok {
+				// remove
+				continue
+			}
+			updated = append(updated, placements[i])
+		}
+		placements = updated
+	}
+
+	// add new placements from spec:
+	for placementID, p := range fromSpec {
+		if _, ok := inConfig[placementID]; ok {
+			// already in config
+			continue
+		}
+		pObj, err := toObj(p)
+		if err != nil {
+			return nil, fmt.Errorf("unable convert pool placement %q for zone %q: %w", placementID, name, err)
+		}
+		placements = append(placements, pObj)
+	}
+
+	// sort placements array.
+	// Reason: 'radosgw-admin zone set --infile' sorts placement_pools by key before storing it in ceph
+	// and returns JSON with sorted placement_pools array. So we sort input array for easy comparison with applied JSON.
+	sort.Slice(placements, func(i, j int) bool {
+		pI, ok := placements[i].(map[string]any)
+		if !ok {
+			return false
+		}
+		nameI, err := getObjProperty[string](pI, "key")
+		if err != nil {
+			return false
+		}
+		pJ, ok := placements[j].(map[string]any)
+		if !ok {
+			return false
+		}
+		nameJ, err := getObjProperty[string](pJ, "key")
+		if err != nil {
+			return false
+		}
+		return nameI < nameJ
+	})
+
+	_, err = updateObjProperty(zone, placements, "placement_pools")
+	if err != nil {
+		return nil, fmt.Errorf("unable to set pool placements for zone %q: %w", name, err)
+	}
+	return zone, nil
+}
+
+// getPlacementUpdate returns the value an existing zone placement must be updated to, or
+// updateNeeded=false if it stays as is.
+func getPlacementUpdate(placementID string, fromZone ZonePlacementPoolVal, poolsExist bool, fromSpec map[string]ZonePlacementPool, defaultPlacementName string) (update ZonePlacementPoolVal, updateNeeded bool, err error) {
+	specPlacement, inSpec := fromSpec[placementID]
+	switch {
+	case inSpec && poolsExist:
+		// placement is in use: the spec may add or remove storage classes but not change pools
+		if err := fromZone.validatePoolsUnchanged(specPlacement.Val); err != nil {
+			return ZonePlacementPoolVal{}, false, err
+		}
+		return specPlacement.Val, true, nil
+	case inSpec:
+		return specPlacement.Val, true, nil
+	case poolsExist:
+		// 'default-placement' is in use and cannot be removed (https://tracker.ceph.com/issues/68775)
+		return ZonePlacementPoolVal{}, false, nil
+	default:
+		// 'default-placement' on a fresh zone: set it to the pools of the placement marked default, if any
+		defaultPlacement, hasDefault := fromSpec[defaultPlacementName]
+		if !hasDefault {
+			return ZonePlacementPoolVal{}, false, nil
+		}
+		return defaultPlacement.Val, true, nil
+	}
+}
+
+// parseZonePlacementPoolVal decodes the "val" object of a zone placement_pools entry.
+func parseZonePlacementPoolVal(placement map[string]any) (ZonePlacementPoolVal, error) {
+	val, err := getObjProperty[map[string]any](placement, "val")
+	if err != nil {
+		return ZonePlacementPoolVal{}, err
+	}
+	var res ZonePlacementPoolVal
+	if !castJson(val, &res) {
+		return res, fmt.Errorf("unexpected pool placement format: %+v", val)
+	}
+	return res, nil
+}
+
+// pools lists the pools referenced by the placement, RADOS namespace stripped:
+// the index pool, the data extra pool, and the data pool of every storage class.
+func (v ZonePlacementPoolVal) pools() []string {
+	namespaced := []string{v.IndexPool, v.DataExtraPool}
+	for _, sc := range v.StorageClasses {
+		namespaced = append(namespaced, sc.DataPool)
+	}
+	pools := make([]string, 0, len(namespaced))
+	for _, p := range namespaced {
+		poolName, _, _ := strings.Cut(p, ":")
+		pools = append(pools, poolName)
+	}
+	return pools
+}
+
+// poolsExist reports whether any pool referenced by the placement exists in the cluster.
+// A placement whose pools do not exist cannot hold buckets and is safe to redefine.
+func (v ZonePlacementPoolVal) poolsExist(existingPools sets.Set[string]) bool {
+	for _, p := range v.pools() {
+		if existingPools.Has(p) {
+			return true
+		}
+	}
+	return false
+}
+
+// validatePoolsUnchanged compares the current placement v with desired and returns an error if a pool
+// present in both differs: the index pool, the data extra pool, or the data pool of a storage class.
+// Storage classes only in one of them are ignored, so adding and removing classes is allowed.
+func (v ZonePlacementPoolVal) validatePoolsUnchanged(desired ZonePlacementPoolVal) error {
+	const hint = "pools of an existing placement are immutable because buckets reference them; to place new buckets elsewhere add a new placement and mark it default"
+
+	if v.IndexPool != desired.IndexPool {
+		return fmt.Errorf("index pool cannot be changed from %q to %q: %s", v.IndexPool, desired.IndexPool, hint)
+	}
+	if v.DataExtraPool != desired.DataExtraPool {
+		return fmt.Errorf("data extra pool cannot be changed from %q to %q: %s", v.DataExtraPool, desired.DataExtraPool, hint)
+	}
+	scNames := make([]string, 0, len(v.StorageClasses))
+	for sc := range v.StorageClasses {
+		scNames = append(scNames, sc)
+	}
+	sort.Strings(scNames)
+	for _, sc := range scNames {
+		desiredSC, ok := desired.StorageClasses[sc]
+		if !ok {
+			// storage class removed from spec
+			continue
+		}
+		if v.StorageClasses[sc].DataPool != desiredSC.DataPool {
+			return fmt.Errorf("storage class %q data pool cannot be changed from %q to %q: %s", sc, v.StorageClasses[sc].DataPool, desiredSC.DataPool, hint)
+		}
+	}
+	return nil
+}
+
+func getDefaultPlacementName(spec cephv1.ObjectSharedPoolsSpec) string {
+	for _, p := range spec.PoolPlacements {
+		if p.Default {
+			return p.Name
+		}
+	}
+	return defaultPlacementCephConfigName
+}
+
+func getDefaultMetadataPool(spec cephv1.ObjectSharedPoolsSpec) string {
+	for _, p := range spec.PoolPlacements {
+		if p.Default {
+			return p.MetadataPoolName
+		}
+	}
+	return spec.MetadataPoolName
+}
+
+// toZonePlacementPools converts the pool placement CRD definition to zone config json format structures
+func toZonePlacementPools(spec cephv1.ObjectSharedPoolsSpec, ns string) map[string]ZonePlacementPool {
+	res := make(map[string]ZonePlacementPool, len(spec.PoolPlacements)+1)
+	// map sharedPools if present:
+	if spec.DataPoolName != "" && spec.MetadataPoolName != "" {
+		res[defaultPlacementCephConfigName] = ZonePlacementPool{
+			Key: defaultPlacementCephConfigName,
+			Val: ZonePlacementPoolVal{
+				// The extra pool is for omap data for multi-part uploads, so we use
+				// the metadata pool instead of the data pool.
+				DataExtraPool: spec.MetadataPoolName + ":" + ns + ".buckets.non-ec",
+				IndexPool:     spec.MetadataPoolName + ":" + ns + ".buckets.index",
+				StorageClasses: map[string]ZonePlacementStorageClass{
+					defaultPlacementStorageClass: {
+						DataPool: spec.DataPoolName + ":" + ns + ".buckets.data",
+					},
+				},
+				// Workaround: radosgw-admin set zone json command sets incorrect default value for placement inline_data field.
+				// So we should set default value (true) explicitly.
+				// See: https://tracker.ceph.com/issues/67933
+				InlineData: true,
+			},
+		}
+	}
+	// map pool placements:
+	for _, pp := range spec.PoolPlacements {
+		res[pp.Name] = toZonePlacementPool(pp, ns)
+	}
+	return res
+}
+
+func toZonePlacementPool(spec cephv1.PoolPlacementSpec, ns string) ZonePlacementPool {
+	placementNS := ns + "." + spec.Name
+	// The extra pool is for omap data for multi-part uploads, so we use
+	// the metadata pool instead of the data pool.
+	nonECPool := spec.MetadataPoolName + ":" + placementNS + ".data.non-ec"
+	if spec.DataNonECPoolName != "" {
+		nonECPool = spec.DataNonECPoolName + ":" + placementNS + ".data.non-ec"
+	}
+
+	res := ZonePlacementPool{
+		Key: spec.Name,
+		Val: ZonePlacementPoolVal{
+			DataExtraPool: nonECPool,
+			IndexPool:     spec.MetadataPoolName + ":" + placementNS + ".index",
+			StorageClasses: map[string]ZonePlacementStorageClass{
+				defaultPlacementStorageClass: {
+					DataPool: spec.DataPoolName + ":" + placementNS + ".data",
+				},
+			},
+			// Workaround: 'radosgw-admin set zone json' command sets incorrect default value for placement inline_data field.
+			// So we should set default value (true) explicitly.
+			// See: https://tracker.ceph.com/issues/67933
+			InlineData: true,
+		},
+	}
+	for _, v := range spec.StorageClasses {
+		res.Val.StorageClasses[v.Name] = ZonePlacementStorageClass{
+			DataPool: v.DataPoolName + ":" + ns + "." + v.Name,
+		}
+	}
+	return res
+}
+
+func adjustZoneGroupPlacementTargets(group, zone map[string]any, defaultPlacement string) (map[string]any, error) {
+	name, err := getObjProperty[string](group, "name")
+	if err != nil {
+		return nil, fmt.Errorf("unable to get zonegroup name: %w", err)
+	}
+
+	// deep copy source group
+	group, err = deepCopyJson(group)
+	if err != nil {
+		return nil, fmt.Errorf("unable to deep copy config for zonegroup %s: %w", name, err)
+	}
+
+	_, err = updateObjProperty(group, defaultPlacement, "default_placement")
+	if err != nil {
+		return nil, fmt.Errorf("unable to set default_placement for zonegroup %s: %w", name, err)
+	}
+
+	desiredTargets, err := createPlacementTargetsFromZonePoolPlacements(zone)
+	if err != nil {
+		return nil, fmt.Errorf("unable to create targets from placements for zonegroup %q: %w", name, err)
+	}
+	currentTargets, err := getObjProperty[[]any](group, "placement_targets")
+	if err != nil {
+		return nil, fmt.Errorf("unable to get targets from placements for zonegroup %q: %w", name, err)
+	}
+
+	applied := map[string]struct{}{}
+	idxToRemove := map[int]struct{}{}
+	for i, target := range currentTargets {
+		tObj, ok := target.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("unable to cast placement target to object for zonegroup %q: %+v", name, target)
+		}
+		tName, err := getObjProperty[string](tObj, "name")
+		if err != nil {
+			return nil, fmt.Errorf("unable to get placement target name for zonegroup %q: %w", name, err)
+		}
+		// update target:
+		if desired, ok := desiredTargets[tName]; ok {
+			sc := []any{}
+			ok = castJson(desired.StorageClasses, &sc)
+			if ok {
+				_, err = updateObjProperty(tObj, sc, "storage_classes")
+			} else {
+				_, err = updateObjProperty(tObj, desired.StorageClasses, "storage_classes")
+			}
+			if err != nil {
+				return nil, fmt.Errorf("unable to set storage classes to pool placement target %q for zonegroup %q: %w", tName, name, err)
+			}
+			applied[tName] = struct{}{}
+		} else {
+			// remove target
+			idxToRemove[i] = struct{}{}
+			continue
+		}
+	}
+	if len(idxToRemove) != 0 {
+		// delete targets from slice
+		updated := make([]any, 0, len(currentTargets)-len(idxToRemove))
+		for i := range currentTargets {
+			if _, ok := idxToRemove[i]; ok {
+				// remove
+				continue
+			}
+			updated = append(updated, currentTargets[i])
+		}
+		currentTargets = updated
+	}
+
+	// add new targets:
+	for targetName, target := range desiredTargets {
+		if _, ok := applied[targetName]; ok {
+			// already in config
+			continue
+		}
+		tObj, err := toObj(target)
+		if err != nil {
+			return nil, fmt.Errorf("unable convert placement target %q for zonegroup %q: %w", targetName, name, err)
+		}
+		currentTargets = append(currentTargets, tObj)
+	}
+
+	_, err = updateObjProperty(group, currentTargets, "placement_targets")
+	if err != nil {
+		return nil, fmt.Errorf("unable to set placement targets for zonegroup %q: %w", name, err)
+	}
+
+	return group, nil
+}
+
+func createPlacementTargetsFromZonePoolPlacements(zone map[string]any) (map[string]ZonegroupPlacementTarget, error) {
+	zoneName, err := getObjProperty[string](zone, "name")
+	if err != nil {
+		return nil, fmt.Errorf("unable to get zone name: %w", err)
+	}
+
+	zonePoolPlacements, err := getObjProperty[[]any](zone, "placement_pools")
+	if err != nil {
+		return nil, fmt.Errorf("unable to get pool placements for zone %q: %w", zoneName, err)
+	}
+
+	res := make(map[string]ZonegroupPlacementTarget, len(zonePoolPlacements))
+	for _, pp := range zonePoolPlacements {
+		ppObj, ok := pp.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("unable to cast zone pool placement to json obj for zone %q: %+v", zoneName, pp)
+		}
+		name, err := getObjProperty[string](ppObj, "key")
+		if err != nil {
+			return nil, fmt.Errorf("unable to get pool placement key for zone %q: %w", zoneName, err)
+		}
+		storClasses, err := getObjProperty[map[string]any](ppObj, "val", "storage_classes")
+		if err != nil {
+			return nil, fmt.Errorf("unable to get pool placement storage classes for zone %q: %w", zoneName, err)
+		}
+		target := ZonegroupPlacementTarget{
+			Name: name,
+		}
+		for sc := range storClasses {
+			target.StorageClasses = append(target.StorageClasses, sc)
+		}
+		sort.Strings(target.StorageClasses)
+		res[name] = target
+	}
+	return res, nil
+}
+
+func getZoneJSON(objContext *Context) (map[string]any, error) {
+	if objContext.Realm == "" {
+		return nil, fmt.Errorf("get zone: object store realm is missing from context")
+	}
+	realmArg := fmt.Sprintf("--rgw-realm=%s", objContext.Realm)
+
+	if objContext.Zone == "" {
+		return nil, fmt.Errorf("get zone: object store zone is missing from context")
+	}
+	zoneArg := fmt.Sprintf("--rgw-zone=%s", objContext.Zone)
+
+	log.NamedDebug(objContext.NsName(), logger, "get zone: rgw-realm=%s, rgw-zone=%s", objContext.Realm, objContext.Zone)
+
+	jsonStr, err := RunAdminCommandNoMultisite(objContext, true, "zone", "get", realmArg, zoneArg)
+	if err != nil {
+		// This handles the case where the pod we use to exec command (act as a proxy) is not found/ready yet
+		// The caller can nicely handle the error and not overflow the op logs with misleading error messages
+		if kerrors.IsNotFound(err) {
+			return nil, err
+		}
+		return nil, errors.Wrap(err, "failed to get rgw zone group")
+	}
+	// the response carries the realm system user's live S3 credentials, so the line keeps only
+	// the fields rook reads: the pools and placements it is here to show
+	if logger.LevelAt(capnslog.DEBUG) {
+		log.NamedDebug(objContext.NsName(), logger, "get zone success: rgw-realm=%s, rgw-zone=%s, res=%s", objContext.Realm, objContext.Zone, RedactZoneJSON(jsonStr))
+	}
+	res := map[string]any{}
+	return res, json.Unmarshal([]byte(jsonStr), &res)
+}
+
+func getZoneGroupJSON(objContext *Context) (map[string]any, error) {
+	if objContext.Realm == "" {
+		return nil, fmt.Errorf("get zonegroup: object store realm is missing from context")
+	}
+	realmArg := fmt.Sprintf("--rgw-realm=%s", objContext.Realm)
+
+	if objContext.Zone == "" {
+		return nil, fmt.Errorf("get zonegroup: object store zone is missing from context")
+	}
+	zoneArg := fmt.Sprintf("--rgw-zone=%s", objContext.Zone)
+
+	if objContext.ZoneGroup == "" {
+		return nil, fmt.Errorf("get zonegroup: object store zonegroup is missing from context")
+	}
+	zoneGroupArg := fmt.Sprintf("--rgw-zonegroup=%s", objContext.ZoneGroup)
+
+	log.NamedDebug(objContext.NsName(), logger, "get zonegroup: rgw-realm=%s, rgw-zone=%s, rgw-zonegroup=%s", objContext.Realm, objContext.Zone, objContext.ZoneGroup)
+	jsonStr, err := RunAdminCommandNoMultisite(objContext, true, "zonegroup", "get", realmArg, zoneGroupArg, zoneArg)
+	if err != nil {
+		// This handles the case where the pod we use to exec command (act as a proxy) is not found/ready yet
+		// The caller can nicely handle the error and not overflow the op logs with misleading error messages
+		if kerrors.IsNotFound(err) {
+			return nil, err
+		}
+		return nil, errors.Wrap(err, "failed to get rgw zone group")
+	}
+	log.NamedDebug(objContext.NsName(), logger, "get zonegroup success: rgw-realm=%s, rgw-zone=%s, rgw-zonegroup=%s, res=%s", objContext.Realm, objContext.Zone, objContext.ZoneGroup, jsonStr)
+	res := map[string]any{}
+	return res, json.Unmarshal([]byte(jsonStr), &res)
+}
+
+func updateZoneJSON(objContext *Context, zone map[string]any) (map[string]any, error) {
+	if objContext.Realm == "" {
+		return nil, fmt.Errorf("update zone: object store realm is missing from context")
+	}
+	realmArg := fmt.Sprintf("--rgw-realm=%s", objContext.Realm)
+
+	if objContext.Zone == "" {
+		return nil, fmt.Errorf("update zone: object store zone is missing from context")
+	}
+	zoneArg := fmt.Sprintf("--rgw-zone=%s", objContext.Zone)
+
+	configBytes, err := json.Marshal(zone)
+	if err != nil {
+		return nil, err
+	}
+	configFilename := path.Join(objContext.Context.ConfigDir, objContext.Name+".zonecfg")
+	if err := os.WriteFile(configFilename, configBytes, 0o600); err != nil {
+		return nil, errors.Wrap(err, "failed to write zone config file")
+	}
+	defer os.Remove(configFilename)
+
+	args := []string{"zone", "set", zoneArg, "--infile=" + configFilename, realmArg}
+	updatedBytes, err := RunAdminCommandNoMultisite(objContext, false, args...)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to set zone config")
+	}
+	// both documents carry the realm system user's live S3 credentials - the same credentials
+	// the config file above is written 0600 to keep readable only by the uid the operator runs
+	// as, a bar the operator log does not meet - so both keep only the fields rook reads, which
+	// are the fields this update changes
+	if logger.LevelAt(capnslog.DEBUG) {
+		log.NamedDebug(objContext.NsName(), logger, "update zone: %s json config updated value from %q to %q", objContext.Zone, RedactZoneJSON(string(configBytes)), RedactZoneJSON(string(updatedBytes)))
+	}
+	updated := map[string]any{}
+	err = json.Unmarshal([]byte(updatedBytes), &updated)
+	return updated, err
+}
+
+func updateZoneGroupJSON(objContext *Context, group map[string]any) (map[string]any, error) {
+	if objContext.Realm == "" {
+		return nil, fmt.Errorf("update zonegroup: object store realm is missing from context")
+	}
+	realmArg := fmt.Sprintf("--rgw-realm=%s", objContext.Realm)
+
+	if objContext.Zone == "" {
+		return nil, fmt.Errorf("update zonegroup: object store zone is missing from context")
+	}
+	zoneArg := fmt.Sprintf("--rgw-zone=%s", objContext.Zone)
+
+	if objContext.ZoneGroup == "" {
+		return nil, fmt.Errorf("update zonegroup: object store zonegroup is missing from context")
+	}
+	zoneGroupArg := fmt.Sprintf("--rgw-zonegroup=%s", objContext.ZoneGroup)
+
+	configBytes, err := json.Marshal(group)
+	if err != nil {
+		return nil, err
+	}
+	configFilename := path.Join(objContext.Context.ConfigDir, objContext.Name+".zonegroupcfg")
+	if err := os.WriteFile(configFilename, configBytes, 0o600); err != nil {
+		return nil, errors.Wrap(err, "failed to write zonegroup config file")
+	}
+	defer os.Remove(configFilename)
+
+	args := []string{"zonegroup", "set", zoneArg, "--infile=" + configFilename, realmArg, zoneGroupArg}
+	updatedBytes, err := RunAdminCommandNoMultisite(objContext, false, args...)
+	if err != nil {
+		return nil, errors.Wrap(err, fmt.Sprintf("failed to set zonegroup config %s", updatedBytes))
+	}
+	updated := map[string]any{}
+	err = json.Unmarshal([]byte(updatedBytes), &updated)
+	return updated, err
+}
+
+type ZonegroupPlacementTarget struct {
+	Name           string   `json:"name"`
+	StorageClasses []string `json:"storage_classes"`
+}
+
+type ZonePlacementPool struct {
+	Key string               `json:"key"`
+	Val ZonePlacementPoolVal `json:"val"`
+}
+
+type ZonePlacementPoolVal struct {
+	DataExtraPool  string                               `json:"data_extra_pool"`
+	IndexPool      string                               `json:"index_pool"`
+	StorageClasses map[string]ZonePlacementStorageClass `json:"storage_classes"`
+	InlineData     bool                                 `json:"inline_data"`
+}
+
+type ZonePlacementStorageClass struct {
+	DataPool string `json:"data_pool"`
+}

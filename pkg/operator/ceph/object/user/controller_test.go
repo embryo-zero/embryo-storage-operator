@@ -1,0 +1,1567 @@
+/*
+Copyright 2018 The Rook Authors. All rights reserved.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+// Package objectuser to manage a rook object store.
+package objectuser
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/ceph/go-ceph/rgw/admin"
+	"github.com/coreos/pkg/capnslog"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
+	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/operator/test"
+
+	"github.com/rook/rook/pkg/clusterd"
+	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
+	cephobject "github.com/rook/rook/pkg/operator/ceph/object"
+	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	exectest "github.com/rook/rook/pkg/util/exec/test"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+)
+
+const (
+	//nolint:gosec // only test values, not a real secret
+	userCreateJSON = `{
+	"user_id": "my-user",
+	"display_name": "my-user",
+	"email": "",
+	"suspended": 0,
+	"max_buckets": 1000,
+	"subusers": [],
+	"keys": [
+		{
+			"user": "my-user",
+			"access_key": "EOE7FYCNOBZJ5VFV909G",
+			"secret_key": "qmIqpWm8HxCzmynCrD6U6vKWi4hnDBndOnmxXNsV"
+		}
+	],
+	"swift_keys": [],
+	"caps": [
+		{
+			"type": "users",
+			"perm": "*"
+		}
+	],
+	"op_mask": "read, write, delete",
+	"default_placement": "",
+	"default_storage_class": "",
+	"placement_tags": [],
+	"bucket_quota": {
+		"enabled": false,
+		"check_on_raw": false,
+		"max_size": -1,
+		"max_size_kb": 0,
+		"max_objects": -1
+	},
+	"user_quota": {
+		"enabled": false,
+		"check_on_raw": false,
+		"max_size": -1,
+		"max_size_kb": 0,
+		"max_objects": -1
+	},
+	"temp_url_keys": [],
+	"type": "rgw",
+	"mfa_ids": []
+}`
+	userCapsJSON        = `[{"type":"users","perm":"read"}]`
+	cephMonVersionsJSON = `{"mon":{"ceph version 19.2.0 (3a54b2b6d167d4a2a19e003a705696) squid (stable)":1}}`
+)
+
+var (
+	name             = "my-user"
+	namespace        = "rook-ceph"
+	store            = "my-store"
+	maxbucket        = 200
+	maxsizestr       = "10G"
+	maxobject  int64 = 10000
+)
+
+func TestCephObjectStoreUserController(t *testing.T) {
+	ctx := t.Context()
+	// Set DEBUG logging
+	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
+	cephObjectStore := &cephv1.CephObjectStore{}
+	objectUser := &cephv1.CephObjectStoreUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Namespace:  namespace,
+			Finalizers: []string{"cephobjectstoreuser.ceph.rook.io"},
+		},
+		Spec: cephv1.ObjectStoreUserSpec{
+			Store: store,
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "CephObjectStoreUser",
+		},
+	}
+	cephCluster := &cephv1.CephCluster{}
+
+	// Objects to track in the fake client.
+	object := []runtime.Object{
+		objectUser,
+		cephCluster,
+	}
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			if args[0] == "versions" {
+				return cephMonVersionsJSON, nil
+			}
+			if args[0] == "status" {
+				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_ERR"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+			}
+			return "", nil
+		},
+	}
+	clientset := test.New(t, 3)
+	c := &clusterd.Context{
+		Executor:      executor,
+		RookClientset: rookclient.NewSimpleClientset(),
+		Clientset:     clientset,
+	}
+
+	// Register operator types with the runtime scheme.
+	s := scheme.Scheme
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStoreUser{}, &cephv1.CephCluster{}, &cephv1.CephClusterList{})
+
+	// Create a fake client to mock API calls.
+	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+	// Create a ReconcileObjectStoreUser object with the scheme and fake client.
+	r := &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+
+	// Mock request to simulate Reconcile() being called on an event for a
+	// watched resource .
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      name,
+			Namespace: namespace,
+		},
+	}
+
+	t.Run("failure because no CephCluster", func(t *testing.T) {
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+	})
+
+	t.Run("failure CephCluster not ready", func(t *testing.T) {
+		cephCluster = &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      namespace,
+				Namespace: namespace,
+			},
+			Status: cephv1.ClusterStatus{
+				Phase: "",
+				CephStatus: &cephv1.CephStatus{
+					Health: "",
+				},
+			},
+		}
+
+		object = append(object, cephCluster)
+		// Create a fake client to mock API calls.
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		// Create a ReconcileObjectStoreUser object with the scheme and fake client.
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+	})
+
+	t.Run("failure CephCluster is ready but NO rgw object", func(t *testing.T) {
+		// Mock clusterInfo
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err := c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// Add ready status to the CephCluster
+		cephCluster.Status.Phase = k8sutil.ReadyStatus
+		cephCluster.Status.CephStatus.Health = "HEALTH_OK"
+
+		// Create a fake client to mock API calls.
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+
+		executor = &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if args[0] == "versions" {
+					return cephMonVersionsJSON, nil
+				}
+				if args[0] == "status" {
+					return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+				}
+				return "", nil
+			},
+			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+				if args[0] == "user" {
+					return userCreateJSON, nil
+				}
+				return "", nil
+			},
+		}
+		c.Executor = executor
+
+		// Create a ReconcileObjectStoreUser object with the scheme and fake client.
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+	})
+
+	t.Run("failure Rgw object exists but NO pod are running", func(t *testing.T) {
+		cephObjectStore = &cephv1.CephObjectStore{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      store,
+				Namespace: namespace,
+			},
+			TypeMeta: metav1.TypeMeta{
+				Kind: "CephObjectStore",
+			},
+			Spec: cephv1.ObjectStoreSpec{
+				Gateway: cephv1.GatewaySpec{
+					Port: 80,
+				},
+			},
+			Status: &cephv1.ObjectStoreStatus{
+				Info: map[string]string{"endpoint": "http://rook-ceph-rgw-my-store.rook-ceph:80"},
+			},
+		}
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStore{})
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStoreList{})
+		object = append(object, cephObjectStore)
+
+		// Create a fake client to mock API calls.
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		// Create a ReconcileObjectStoreUser object with the scheme and fake client.
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+
+		err := r.client.Get(t.Context(), types.NamespacedName{Name: store, Namespace: namespace}, cephObjectStore)
+		assert.NoError(t, err, cephObjectStore)
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+	})
+
+	t.Run("success Rgw object exists and pods are running", func(t *testing.T) {
+		rgwPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:      "rook-ceph-rgw-my-store-a-5fd6fb4489-xv65v",
+			Namespace: namespace,
+			Labels:    map[string]string{k8sutil.AppAttr: appName, "rgw": "my-store"},
+		}}
+
+		// Get the updated object.
+		// Create RGW pod
+		err := r.client.Create(t.Context(), rgwPod)
+		assert.NoError(t, err)
+
+		// Mock client
+		newMultisiteAdminOpsCtxFunc = func(objContext *cephobject.Context, spec *cephv1.ObjectStoreSpec) (*cephobject.AdminOpsContext, error) {
+			mockClient := &cephobject.MockClient{
+				MockDo: func(req *http.Request) (*http.Response, error) {
+					if (req.URL.RawQuery == "display-name=my-user&format=json&max-buckets=1000&op-mask=read%2C%20write%2C%20delete&uid=my-user" && req.Method == http.MethodPost && req.URL.Path == "rook-ceph-rgw-my-store.mycluster.svc/admin/user") ||
+						(req.URL.RawQuery == "enabled=false&format=json&max-objects=-1&max-size=-1&quota=&quota-type=user&uid=my-user" && req.Method == http.MethodPut && req.URL.Path == "rook-ceph-rgw-my-store.mycluster.svc/admin/user") ||
+						(req.URL.RawQuery == "format=json&uid=my-user" && req.Method == http.MethodGet && req.URL.Path == "rook-ceph-rgw-my-store.mycluster.svc/admin/user") {
+						return &http.Response{
+							StatusCode: 200,
+							Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+						}, nil
+					}
+					if req.Method == http.MethodDelete && req.URL.RawQuery == "caps=&format=json&uid=my-user&user-caps=users%3D%2A%3B" {
+						return &http.Response{
+							StatusCode: 200,
+							Body:       io.NopCloser(bytes.NewReader([]byte(`[]`))),
+						}, nil
+					}
+					return nil, fmt.Errorf("unexpected request: %q. method %q. path %q", req.URL.RawQuery, req.Method, req.URL.Path)
+				},
+			}
+
+			context, err := cephobject.NewMultisiteContext(r.context, r.clusterInfo, cephObjectStore)
+			assert.NoError(t, err)
+			adminClient, err := admin.New("rook-ceph-rgw-my-store.mycluster.svc", "53S6B9S809NUP19IJ2K3", "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", mockClient)
+			assert.NoError(t, err)
+
+			return &cephobject.AdminOpsContext{
+				Context:               *context,
+				AdminOpsUserAccessKey: "53S6B9S809NUP19IJ2K3",
+				// #nosec G101 -- fake test credential
+				AdminOpsUserSecretKey: "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", // notsecret
+				AdminOpsClient:        adminClient,
+			}, nil
+		}
+
+		// Run reconcile
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		err = r.client.Get(t.Context(), req.NamespacedName, objectUser)
+		assert.NoError(t, err)
+		assert.Equal(t, "Ready", objectUser.Status.Phase, objectUser)
+	})
+
+	t.Run("invalid secretTemplate fails before any RGW user change", func(t *testing.T) {
+		invalidUser := objectUser.DeepCopy()
+		invalidUser.Spec.SecretTemplate.Labels = map[string]cephv1.LabelValue{"team": "payments team"}
+		require.NoError(t, r.client.Update(ctx, invalidUser))
+
+		previous := newMultisiteAdminOpsCtxFunc
+		t.Cleanup(func() { newMultisiteAdminOpsCtxFunc = previous })
+		var mutatingRequests []string
+		newMultisiteAdminOpsCtxFunc = func(objContext *cephobject.Context, spec *cephv1.ObjectStoreSpec) (*cephobject.AdminOpsContext, error) {
+			mockClient := &cephobject.MockClient{
+				MockDo: func(req *http.Request) (*http.Response, error) {
+					if req.Method != http.MethodGet {
+						mutatingRequests = append(mutatingRequests, req.Method+" "+req.URL.String())
+					}
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+					}, nil
+				},
+			}
+			context, err := cephobject.NewMultisiteContext(r.context, r.clusterInfo, cephObjectStore)
+			require.NoError(t, err)
+			adminClient, err := admin.New("rook-ceph-rgw-my-store.mycluster.svc", "53S6B9S809NUP19IJ2K3", "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", mockClient)
+			require.NoError(t, err)
+			return &cephobject.AdminOpsContext{
+				Context:               *context,
+				AdminOpsUserAccessKey: "53S6B9S809NUP19IJ2K3",
+				// #nosec G101 -- fake test credential
+				AdminOpsUserSecretKey: "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", // notsecret
+				AdminOpsClient:        adminClient,
+			}, nil
+		}
+		recorder := events.NewFakeRecorder(10)
+		r.recorder = recorder
+
+		_, err := r.Reconcile(ctx, req)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `spec.secretTemplate.labels: Invalid value: "payments team"`)
+		assert.Empty(t, mutatingRequests)
+
+		require.NoError(t, r.client.Get(ctx, req.NamespacedName, invalidUser))
+		assert.Equal(t, k8sutil.ReconcileFailedStatus, invalidUser.Status.Phase)
+		var failureEvent string
+		for len(recorder.Events) > 0 {
+			if e := <-recorder.Events; strings.Contains(e, string(cephv1.ReconcileFailed)) {
+				failureEvent = e
+			}
+		}
+		assert.Contains(t, failureEvent, `spec.secretTemplate.labels: Invalid value: "payments team"`)
+	})
+
+	t.Run("cluster and object store in different namespace", func(t *testing.T) {
+		cephCluster = &cephv1.CephCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      namespace,
+				Namespace: namespace,
+			},
+			Status: cephv1.ClusterStatus{
+				Phase: k8sutil.ReadyStatus,
+				CephStatus: &cephv1.CephStatus{
+					Health: "HEALTH_OK",
+				},
+			},
+		}
+		cephObjectStore.Spec.AllowUsersInNamespaces = []string{"*"}
+
+		// Create a fake client to mock API calls.
+		objectUser.Spec.ClusterNamespace = namespace
+		objectUser.Namespace = "foo"
+		req.Namespace = "foo"
+		object = []runtime.Object{cephObjectStore, objectUser, cephCluster}
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+
+		rgwPod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name:      "rook-ceph-rgw-my-store-a-5fd6fb4489-xv65v",
+			Namespace: namespace,
+			Labels:    map[string]string{k8sutil.AppAttr: appName, "rgw": "my-store"},
+		}}
+
+		// Create a user in a different namespace, and where the cephcluster does exist
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+		err := r.client.Create(t.Context(), rgwPod)
+		assert.NoError(t, err)
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+
+		// Disallow creating a user in a different namespace
+		cephObjectStore.Spec.AllowUsersInNamespaces = []string{}
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+		res, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+
+		objectUser.Spec.ClusterNamespace = ""
+		object = []runtime.Object{objectUser, cephCluster}
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+
+		// Create a user in a different namespace, but where the cephcluster doesn't exist
+		r = &ReconcileObjectStoreUser{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+		res, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.True(t, res.Requeue)
+
+		req.Namespace = namespace
+		objectUser.Namespace = namespace
+	})
+
+	t.Run("users allowed in other namespace", func(t *testing.T) {
+		assert.False(t, userInNamespaceAllowed("foo", []string{}))
+		assert.False(t, userInNamespaceAllowed("foo", []string{"bar"}))
+		assert.False(t, userInNamespaceAllowed("foo", []string{"bar", "baz"}))
+		assert.True(t, userInNamespaceAllowed("foo", []string{"*"}))
+		assert.True(t, userInNamespaceAllowed("foo", []string{"bar", "*"}))
+		assert.True(t, userInNamespaceAllowed("foo", []string{"foo"}))
+		assert.True(t, userInNamespaceAllowed("foo", []string{"bar", "foo"}))
+	})
+}
+
+func TestBuildUpdateStatusInfo(t *testing.T) {
+	cephObjectStoreUser := &cephv1.CephObjectStoreUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: cephv1.ObjectStoreUserSpec{
+			Store: store,
+		},
+	}
+
+	t.Run("no live user", func(t *testing.T) {
+		statusInfo := generateStatusInfo(cephObjectStoreUser, nil)
+		assert.NotEmpty(t, statusInfo["secretName"])
+		assert.Equal(t, "rook-ceph-object-user-my-store-my-user", statusInfo["secretName"])
+		assert.NotContains(t, statusInfo, "defaultPlacement")
+		assert.NotContains(t, statusInfo, "defaultStorageClass")
+	})
+
+	t.Run("live user without a placement", func(t *testing.T) {
+		statusInfo := generateStatusInfo(cephObjectStoreUser, &admin.User{})
+		assert.NotContains(t, statusInfo, "defaultPlacement")
+		assert.NotContains(t, statusInfo, "defaultStorageClass")
+	})
+
+	t.Run("live user with a placement only", func(t *testing.T) {
+		statusInfo := generateStatusInfo(cephObjectStoreUser, &admin.User{DefaultPlacement: "hot-tier"})
+		assert.Equal(t, "hot-tier", statusInfo["defaultPlacement"])
+		assert.Equal(t, "STANDARD", statusInfo["defaultStorageClass"])
+	})
+
+	t.Run("live user reporting the default storage class explicitly", func(t *testing.T) {
+		statusInfo := generateStatusInfo(cephObjectStoreUser, &admin.User{
+			DefaultPlacement:    "hot-tier",
+			DefaultStorageClass: "STANDARD",
+		})
+		assert.Equal(t, "hot-tier", statusInfo["defaultPlacement"])
+		assert.Equal(t, "STANDARD", statusInfo["defaultStorageClass"])
+	})
+
+	t.Run("live user with a placement and storage class", func(t *testing.T) {
+		statusInfo := generateStatusInfo(cephObjectStoreUser, &admin.User{
+			DefaultPlacement:    "hot-tier",
+			DefaultStorageClass: "STANDARD_IA",
+		})
+		assert.Equal(t, "hot-tier", statusInfo["defaultPlacement"])
+		assert.Equal(t, "STANDARD_IA", statusInfo["defaultStorageClass"])
+	})
+
+	t.Run("live user with an embedded storage class", func(t *testing.T) {
+		statusInfo := generateStatusInfo(cephObjectStoreUser, &admin.User{DefaultPlacement: "hot-tier/STANDARD_IA"})
+		assert.Equal(t, "hot-tier", statusInfo["defaultPlacement"])
+		assert.Equal(t, "STANDARD_IA", statusInfo["defaultStorageClass"])
+	})
+}
+
+func TestCreateOrUpdateCephUser(t *testing.T) {
+	// Set DEBUG logging
+	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
+
+	objectUser := &cephv1.CephObjectStoreUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "",
+			Namespace: namespace,
+		},
+		Spec: cephv1.ObjectStoreUserSpec{
+			Store: store,
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "CephObjectStoreUser",
+		},
+	}
+	mockClient := &cephobject.MockClient{
+		MockDo: func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "rook-ceph-rgw-my-store.mycluster.svc/admin/user" {
+				return nil, fmt.Errorf("unexpected url path %q", req.URL.Path)
+			}
+
+			if req.Method == http.MethodGet {
+				if req.URL.RawQuery == "format=json&uid=my-user" {
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+					}, nil
+				}
+			}
+
+			if req.Method == http.MethodPost {
+				if req.URL.RawQuery == "display-name=my-user&format=json&max-buckets=1000&uid=my-user" ||
+					req.URL.RawQuery == "display-name=my-user&format=json&max-buckets=200&op-mask=read%2C%20write%2C%20delete&uid=my-user" ||
+					req.URL.RawQuery == "display-name=my-user&format=json&max-buckets=1000&uid=my-user&user-caps=users%3Dread%3Bbuckets%3Dread%3B" ||
+					req.URL.RawQuery == "display-name=my-user&format=json&max-buckets=200&uid=my-user&user-caps=users%3Dread%3Bbuckets%3Dread%3B" {
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+					}, nil
+				}
+			}
+
+			if req.Method == http.MethodDelete {
+				if req.URL.RawQuery == "caps=&format=json&uid=my-user&user-caps=users%3Dread%3Bbuckets%3Dread%3B" {
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewReader([]byte(`[]`))),
+					}, nil
+				}
+				if req.URL.RawQuery == "caps=&format=json&uid=my-user&user-caps=users%3D%2A%3B" {
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewReader([]byte(`[]`))),
+					}, nil
+				}
+			}
+			if req.Method == http.MethodPut {
+				switch req.URL.RawQuery {
+				case "enabled=false&format=json&max-objects=-1&max-size=-1&quota=&quota-type=user&uid=my-user",
+					"enabled=true&format=json&max-objects=10000&max-size=-1&quota=&quota-type=user&uid=my-user",
+					"enabled=true&format=json&max-objects=-1&max-size=10000000000&quota=&quota-type=user&uid=my-user",
+					"enabled=true&format=json&max-objects=10000&max-size=10000000000&quota=&quota-type=user&uid=my-user":
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCreateJSON))),
+					}, nil
+				case "caps=&format=json&uid=my-user&user-caps=users%3Dread%3Bbuckets%3Dwrite%3Broles%3D%2A%3Binfo%3Dread%2C%20write%3B":
+					return &http.Response{
+						StatusCode: 200,
+						Body:       io.NopCloser(bytes.NewReader([]byte(userCapsJSON))),
+					}, nil
+				}
+			}
+
+			return nil, fmt.Errorf("unexpected request: %q. method %q. path %q", req.URL.RawQuery, req.Method, req.URL.Path)
+		},
+	}
+	adminClient, err := admin.New("rook-ceph-rgw-my-store.mycluster.svc", "53S6B9S809NUP19IJ2K3", "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", mockClient)
+	assert.NoError(t, err)
+	r := &ReconcileObjectStoreUser{
+		objContext: &cephobject.AdminOpsContext{
+			AdminOpsClient: adminClient,
+		},
+		clusterInfo:      &cephclient.ClusterInfo{CephVersion: cephver.Minimum},
+		opManagerContext: t.Context(),
+	}
+	maxsize, err := resource.ParseQuantity(maxsizestr)
+	assert.NoError(t, err)
+
+	t.Run("user with empty name", func(t *testing.T) {
+		userConfig := &admin.User{}
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.Error(t, err)
+	})
+
+	t.Run("user without any Quotas or Capabilities", func(t *testing.T) {
+		objectUser.Name = name
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+
+	t.Run("setting MaxBuckets for the user", func(t *testing.T) {
+		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxBuckets: &maxbucket}
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+
+	t.Run("setting Capabilities for the user", func(t *testing.T) {
+		objectUser.Spec.Quotas = nil
+		objectUser.Spec.Capabilities = &cephv1.ObjectUserCapSpec{
+			User:   "read",
+			Bucket: "write",
+			Roles:  "*",
+			Info:   "read, write",
+		}
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+
+	// Testing UserQuotaSpec : MaxObjects and MaxSize
+	t.Run("setting MaxObjects for the user", func(t *testing.T) {
+		objectUser.Spec.Capabilities = nil
+		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxObjects: &maxobject}
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+	t.Run("setting MaxSize for the user", func(t *testing.T) {
+		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxSize: &maxsize}
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+	t.Run("resetting MaxSize and MaxObjects for the user", func(t *testing.T) {
+		objectUser.Spec.Quotas = nil
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+	t.Run("setting both MaxSize and MaxObjects for the user", func(t *testing.T) {
+		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxObjects: &maxobject, MaxSize: &maxsize}
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+	t.Run("resetting MaxSize and MaxObjects again for the user", func(t *testing.T) {
+		objectUser.Spec.Quotas = nil
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+
+	t.Run("setting both Quotas and Capabilities for the user", func(t *testing.T) {
+		objectUser.Spec.Capabilities = &cephv1.ObjectUserCapSpec{
+			User:   "read",
+			Bucket: "write",
+			Roles:  "*",
+			Info:   "read, write",
+		}
+		objectUser.Spec.Quotas = &cephv1.ObjectUserQuotaSpec{MaxBuckets: &maxbucket, MaxObjects: &maxobject, MaxSize: &maxsize}
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		require.NoError(t, err)
+		_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+		assert.NoError(t, err)
+	})
+}
+
+func TestGenerateUserConfigCephVersionChecks(t *testing.T) {
+	objectUser := &cephv1.CephObjectStoreUser{
+		ObjectMeta: metav1.ObjectMeta{Name: "my-user", Namespace: namespace},
+		Spec: cephv1.ObjectStoreUserSpec{
+			Store: store,
+		},
+	}
+
+	t.Run("user-info-without-keys skipped on Ceph older than v19.2.0", func(t *testing.T) {
+		objectUser.Spec.Capabilities = &cephv1.ObjectUserCapSpec{
+			UserInfoWithoutKeys: "read",
+		}
+		userConfig, err := generateUserConfig(objectUser, cephver.CephVersion{Major: 19, Minor: 1, Extra: 0})
+		assert.NoError(t, err)
+		assert.NotContains(t, userConfig.UserCaps, "user-info-without-keys=read;")
+	})
+
+	t.Run("user-info-without-keys allowed on Ceph v19.2.0", func(t *testing.T) {
+		objectUser.Spec.Capabilities = &cephv1.ObjectUserCapSpec{
+			UserInfoWithoutKeys: "write",
+		}
+		userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+		assert.NoError(t, err)
+		assert.Contains(t, userConfig.UserCaps, "user-info-without-keys=write;")
+	})
+
+	t.Run("accounts skipped on Ceph older than v19.2.3", func(t *testing.T) {
+		objectUser.Spec.Capabilities = &cephv1.ObjectUserCapSpec{
+			Accounts: "*",
+		}
+		userConfig, err := generateUserConfig(objectUser, cephver.CephVersion{Major: 19, Minor: 2, Extra: 2})
+		assert.NoError(t, err)
+		assert.NotContains(t, userConfig.UserCaps, "accounts=*;")
+	})
+
+	t.Run("accounts allowed on Ceph v19.2.3", func(t *testing.T) {
+		objectUser.Spec.Capabilities = &cephv1.ObjectUserCapSpec{
+			Accounts: "*",
+		}
+		userConfig, err := generateUserConfig(objectUser, accountsMinCephVersion)
+		assert.NoError(t, err)
+		assert.Contains(t, userConfig.UserCaps, "accounts=*;")
+	})
+}
+
+func TestGenerateUserConfigDefaultPlacement(t *testing.T) {
+	var (
+		squid    = cephver.CephVersion{Major: 19, Minor: 2, Extra: 3}
+		tentacle = cephver.CephVersion{Major: 20, Minor: 2, Extra: 0}
+		umbrella = cephver.CephVersion{Major: 21, Minor: 0, Extra: 0}
+	)
+
+	tests := []struct {
+		name             string
+		cephVersion      cephver.CephVersion
+		placement        string
+		storageClass     string
+		wantPlacement    string
+		wantStorageClass string
+	}{
+		{"squid, unset", squid, "", "", "", ""},
+		{"squid, placement only", squid, "hot-tier", "", "hot-tier", ""},
+		{"squid, placement and storage class", squid, "hot-tier", "STANDARD_IA", "hot-tier/STANDARD_IA", ""},
+		{"tentacle, unset", tentacle, "", "", "", ""},
+		{"tentacle, placement only", tentacle, "hot-tier", "", "hot-tier", ""},
+		{"tentacle, placement and storage class", tentacle, "hot-tier", "STANDARD_IA", "hot-tier", "STANDARD_IA"},
+		{"tentacle boundary, placement and storage class", cephver.Tentacle, "hot-tier", "STANDARD_IA", "hot-tier", "STANDARD_IA"},
+		{"umbrella, placement and storage class", umbrella, "hot-tier", "STANDARD_IA", "hot-tier", "STANDARD_IA"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			objectUser := &cephv1.CephObjectStoreUser{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+				Spec: cephv1.ObjectStoreUserSpec{
+					Store:               store,
+					DefaultPlacement:    tt.placement,
+					DefaultStorageClass: tt.storageClass,
+				},
+			}
+
+			userConfig, err := generateUserConfig(objectUser, tt.cephVersion)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantPlacement, userConfig.DefaultPlacement)
+			assert.Equal(t, tt.wantStorageClass, userConfig.DefaultStorageClass)
+		})
+	}
+}
+
+func TestPreserveLiveStorageClass(t *testing.T) {
+	var (
+		squid    = cephver.CephVersion{Major: 19, Minor: 2, Extra: 3}
+		tentacle = cephver.CephVersion{Major: 20, Minor: 2, Extra: 0}
+	)
+
+	tests := []struct {
+		name             string
+		cephVersion      cephver.CephVersion
+		target           admin.User
+		live             admin.User
+		wantPlacement    string
+		wantStorageClass string
+	}{
+		{
+			name:        "squid, unmanaged storage class is carried into an unrelated modify",
+			cephVersion: squid,
+			target: admin.User{
+				DisplayName:      "new name",
+				DefaultPlacement: "hot-tier",
+			},
+			live: admin.User{
+				DisplayName:         "old name",
+				DefaultPlacement:    "hot-tier",
+				DefaultStorageClass: "STANDARD_IA",
+			},
+			wantPlacement:    "hot-tier/STANDARD_IA",
+			wantStorageClass: "",
+		},
+		{
+			name:        "tentacle, unmanaged storage class is carried into an unrelated modify",
+			cephVersion: tentacle,
+			target: admin.User{
+				DisplayName:      "new name",
+				DefaultPlacement: "hot-tier",
+			},
+			live: admin.User{
+				DisplayName:         "old name",
+				DefaultPlacement:    "hot-tier",
+				DefaultStorageClass: "STANDARD_IA",
+			},
+			wantPlacement:    "hot-tier",
+			wantStorageClass: "STANDARD_IA",
+		},
+		{
+			name:        "squid, live storage class embedded in the placement is carried",
+			cephVersion: squid,
+			target: admin.User{
+				DefaultPlacement: "hot-tier",
+			},
+			live: admin.User{
+				DefaultPlacement: "hot-tier/STANDARD_IA",
+			},
+			wantPlacement:    "hot-tier/STANDARD_IA",
+			wantStorageClass: "",
+		},
+		{
+			name:        "a changed placement does not carry the storage class",
+			cephVersion: tentacle,
+			target: admin.User{
+				DefaultPlacement: "cold-tier",
+			},
+			live: admin.User{
+				DefaultPlacement:    "hot-tier",
+				DefaultStorageClass: "STANDARD_IA",
+			},
+			wantPlacement:    "cold-tier",
+			wantStorageClass: "",
+		},
+		{
+			name:        "a managed storage class is left alone",
+			cephVersion: tentacle,
+			target: admin.User{
+				DefaultPlacement:    "hot-tier",
+				DefaultStorageClass: "GLACIER",
+			},
+			live: admin.User{
+				DefaultPlacement:    "hot-tier",
+				DefaultStorageClass: "STANDARD_IA",
+			},
+			wantPlacement:    "hot-tier",
+			wantStorageClass: "GLACIER",
+		},
+		{
+			name:        "an unmanaged placement is left alone",
+			cephVersion: tentacle,
+			target:      admin.User{},
+			live: admin.User{
+				DefaultPlacement:    "hot-tier",
+				DefaultStorageClass: "STANDARD_IA",
+			},
+			wantPlacement:    "",
+			wantStorageClass: "",
+		},
+		{
+			name:        "an unset live storage class leaves the target unchanged",
+			cephVersion: squid,
+			target: admin.User{
+				DefaultPlacement: "hot-tier",
+			},
+			live: admin.User{
+				DefaultPlacement: "hot-tier",
+			},
+			wantPlacement:    "hot-tier",
+			wantStorageClass: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			preserveLiveStorageClass(&tt.target, &tt.live, tt.cephVersion)
+
+			assert.Equal(t, tt.wantPlacement, tt.target.DefaultPlacement)
+			assert.Equal(t, tt.wantStorageClass, tt.target.DefaultStorageClass)
+		})
+	}
+}
+
+func TestCreateOrUpdateCephUserNoKeys(t *testing.T) {
+	// Set DEBUG logging
+	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
+
+	objectUser := &cephv1.CephObjectStoreUser{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: cephv1.ObjectStoreUserSpec{
+			Store: store,
+		},
+		TypeMeta: metav1.TypeMeta{
+			Kind: "CephObjectStoreUser",
+		},
+	}
+
+	// A live RGW user the API returned with no access keys. The user spec also
+	// carries no explicit keys, so createOrUpdateCephUser falls back to the live
+	// user's keys and must surface an error since there are none.
+	//nolint:gosec // only test values, not a real secret
+	userNoKeysJSON := `{
+	"user_id": "my-user",
+	"display_name": "my-user",
+	"max_buckets": 1000,
+	"keys": [],
+	"swift_keys": [],
+	"caps": [],
+	"op_mask": "read, write, delete",
+	"bucket_quota": {"enabled": false, "max_size": -1, "max_objects": -1},
+	"user_quota": {"enabled": false, "max_size": -1, "max_objects": -1},
+	"type": "rgw"
+}`
+
+	mockClient := &cephobject.MockClient{
+		MockDo: func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path != "rook-ceph-rgw-my-store.mycluster.svc/admin/user" {
+				return nil, fmt.Errorf("unexpected url path %q", req.URL.Path)
+			}
+
+			if req.Method == http.MethodGet && req.URL.RawQuery == "format=json&uid=my-user" {
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewReader([]byte(userNoKeysJSON))),
+				}, nil
+			}
+
+			if req.Method == http.MethodPut && req.URL.RawQuery == "enabled=false&format=json&max-objects=-1&max-size=-1&quota=&quota-type=user&uid=my-user" {
+				return &http.Response{
+					StatusCode: 200,
+					Body:       io.NopCloser(bytes.NewReader([]byte(userNoKeysJSON))),
+				}, nil
+			}
+
+			return nil, fmt.Errorf("unexpected request: %q. method %q. path %q", req.URL.RawQuery, req.Method, req.URL.Path)
+		},
+	}
+	adminClient, err := admin.New("rook-ceph-rgw-my-store.mycluster.svc", "53S6B9S809NUP19IJ2K3", "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", mockClient)
+	assert.NoError(t, err)
+	r := &ReconcileObjectStoreUser{
+		objContext: &cephobject.AdminOpsContext{
+			AdminOpsClient: adminClient,
+		},
+		clusterInfo:      &cephclient.ClusterInfo{CephVersion: cephver.Minimum},
+		opManagerContext: t.Context(),
+	}
+
+	userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+	require.NoError(t, err)
+	_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no keys set for user")
+}
+
+func TestValidateUser(t *testing.T) {
+	r := &ReconcileObjectStoreUser{}
+
+	t.Run("standalone user with spaces in displayName is valid", func(t *testing.T) {
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:       store,
+				DisplayName: "My User With Spaces",
+			},
+		}
+		assert.NoError(t, r.validateUser(u))
+	})
+
+	t.Run("account user with IAM-compatible displayName is valid", func(t *testing.T) {
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:       store,
+				DisplayName: "my-user_01",
+				AccountRef:  cephv1.ObjectStoreUserAccountRef{Name: "my-account"},
+			},
+		}
+		assert.NoError(t, r.validateUser(u))
+	})
+
+	t.Run("account user with spaces in displayName is invalid", func(t *testing.T) {
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:       store,
+				DisplayName: "My User",
+				AccountRef:  cephv1.ObjectStoreUserAccountRef{Name: "my-account"},
+			},
+		}
+		err := r.validateUser(u)
+		assert.Error(t, err)
+	})
+
+	t.Run("account user with empty displayName falls back to Name", func(t *testing.T) {
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "valid-name", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:      store,
+				AccountRef: cephv1.ObjectStoreUserAccountRef{Name: "my-account"},
+			},
+		}
+		assert.NoError(t, r.validateUser(u))
+	})
+
+	t.Run("account user with IAM special chars in displayName is valid", func(t *testing.T) {
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:       store,
+				DisplayName: "user+=,.@-test",
+				AccountRef:  cephv1.ObjectStoreUserAccountRef{Name: "my-account"},
+			},
+		}
+		assert.NoError(t, r.validateUser(u))
+	})
+}
+
+func TestValidateSecretTemplate(t *testing.T) {
+	userWith := func(tmpl cephv1.SecretTemplate) *cephv1.CephObjectStoreUser {
+		return &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+			Spec:       cephv1.ObjectStoreUserSpec{Store: store, SecretTemplate: tmpl},
+		}
+	}
+
+	valid := []struct {
+		name string
+		tmpl cephv1.SecretTemplate
+	}{
+		{"empty", cephv1.SecretTemplate{}},
+		{"labels and annotations", cephv1.SecretTemplate{
+			Labels: map[string]cephv1.LabelValue{"team": "payments", "example.com/tier": "gold", "empty": ""},
+			Annotations: map[string]cephv1.AnnotationValue{
+				"reflector.v1.k8s.emberstack.com/reflection-allowed": "true",
+				"free-form": "any value / with spaces",
+			},
+		}},
+		{"annotation key with an uppercase prefix", cephv1.SecretTemplate{
+			Annotations: map[string]cephv1.AnnotationValue{"Example.COM/Replicate": "true"},
+		}},
+		{"keys that only look like rook.io", cephv1.SecretTemplate{
+			Labels:      map[string]cephv1.LabelValue{"notrook.io/x": "y", "rook.io.example.com/x": "y"},
+			Annotations: map[string]cephv1.AnnotationValue{"notrook.io/x": "y"},
+		}},
+	}
+	for _, tt := range valid {
+		t.Run("accepts "+tt.name, func(t *testing.T) {
+			assert.NoError(t, validateSecretTemplate(userWith(tt.tmpl)))
+		})
+	}
+
+	invalid := []struct {
+		name    string
+		tmpl    cephv1.SecretTemplate
+		wantErr string
+	}{
+		{"invalid label key", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"bad key": "v"}}, "spec.secretTemplate.labels"},
+		{"invalid label value", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"team": "payments team"}}, "spec.secretTemplate.labels"},
+		{"label value too long", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"team": cephv1.LabelValue(strings.Repeat("a", 64))}}, "spec.secretTemplate.labels"},
+		{"reserved label app", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"app": "x"}}, "spec.secretTemplate.labels[app]"},
+		{"reserved label user", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"user": "x"}}, "spec.secretTemplate.labels[user]"},
+		{"reserved label rook_cluster", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"rook_cluster": "x"}}, "spec.secretTemplate.labels[rook_cluster]"},
+		{"reserved label rook_object_store", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"rook_object_store": "x"}}, "spec.secretTemplate.labels[rook_object_store]"},
+		{"reserved label do_not_reconcile", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"do_not_reconcile": "true"}}, "spec.secretTemplate.labels[do_not_reconcile]"},
+		{"reserved label rook.io prefix", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"rook.io/x": "y"}}, "spec.secretTemplate.labels[rook.io/x]"},
+		{"reserved label *.rook.io prefix", cephv1.SecretTemplate{Labels: map[string]cephv1.LabelValue{"ceph.rook.io/x": "y"}}, "spec.secretTemplate.labels[ceph.rook.io/x]"},
+		{"invalid annotation key", cephv1.SecretTemplate{Annotations: map[string]cephv1.AnnotationValue{"bad key": "v"}}, "spec.secretTemplate.annotations"},
+		{"annotations too large", cephv1.SecretTemplate{Annotations: map[string]cephv1.AnnotationValue{"big": cephv1.AnnotationValue(strings.Repeat("a", 256*1024))}}, "spec.secretTemplate.annotations"},
+		{"reserved annotation cephx-keyring", cephv1.SecretTemplate{Annotations: map[string]cephv1.AnnotationValue{"cephx-keyring": "x"}}, "spec.secretTemplate.annotations[cephx-keyring]"},
+		{"reserved annotation csi.rook.io", cephv1.SecretTemplate{Annotations: map[string]cephv1.AnnotationValue{"csi.rook.io/RBDProvisionerSecret": "true"}}, "spec.secretTemplate.annotations[csi.rook.io/RBDProvisionerSecret]"},
+	}
+	for _, tt := range invalid {
+		t.Run("rejects "+tt.name, func(t *testing.T) {
+			err := validateSecretTemplate(userWith(tt.tmpl))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.wantErr)
+		})
+	}
+}
+
+func TestCephUserSecretTemplate(t *testing.T) {
+	ctx := t.Context()
+	s := runtime.NewScheme()
+	require.NoError(t, cephv1.AddToScheme(s))
+	require.NoError(t, corev1.AddToScheme(s))
+
+	user := &cephv1.CephObjectStoreUser{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace, UID: "user-uid"},
+		Spec:       cephv1.ObjectStoreUserSpec{Store: store},
+	}
+	userConfig := &admin.User{Keys: []admin.UserKeySpec{{AccessKey: "access", SecretKey: "secret"}}}
+	r := &ReconcileObjectStoreUser{
+		client:           fake.NewClientBuilder().WithScheme(s).Build(),
+		scheme:           s,
+		objContext:       &cephobject.AdminOpsContext{Context: cephobject.Context{Endpoint: "http://rook-ceph-rgw-my-store:80"}},
+		opManagerContext: ctx,
+	}
+	rookLabels := map[string]string{
+		"app":               appName,
+		"user":              name,
+		"rook_cluster":      namespace,
+		"rook_object_store": store,
+	}
+	getSecret := func(t *testing.T) *corev1.Secret {
+		secret := &corev1.Secret{}
+		require.NoError(t, r.client.Get(ctx, types.NamespacedName{Name: generateCephUserSecretName(user), Namespace: namespace}, secret))
+		return secret
+	}
+
+	t.Run("no template keeps only Rook's labels", func(t *testing.T) {
+		_, err := r.reconcileCephUserSecret(user, userConfig, "")
+		require.NoError(t, err)
+		secret := getSecret(t)
+		assert.Equal(t, rookLabels, secret.Labels)
+		assert.Empty(t, secret.Annotations)
+	})
+
+	t.Run("template labels and annotations are added", func(t *testing.T) {
+		user.Spec.SecretTemplate = cephv1.SecretTemplate{
+			Labels:      map[string]cephv1.LabelValue{"team": "payments", "tier": "gold"},
+			Annotations: map[string]cephv1.AnnotationValue{"reflector.v1.k8s.emberstack.com/reflection-allowed": "true"},
+		}
+		_, err := r.reconcileCephUserSecret(user, userConfig, "")
+		require.NoError(t, err)
+		secret := getSecret(t)
+		for k, v := range rookLabels {
+			assert.Equal(t, v, secret.Labels[k], k)
+		}
+		assert.Equal(t, "payments", secret.Labels["team"])
+		assert.Equal(t, "gold", secret.Labels["tier"])
+		assert.Equal(t, map[string]string{"reflector.v1.k8s.emberstack.com/reflection-allowed": "true"}, secret.Annotations)
+	})
+
+	t.Run("entries removed from the template are removed from the Secret", func(t *testing.T) {
+		user.Spec.SecretTemplate = cephv1.SecretTemplate{
+			Labels: map[string]cephv1.LabelValue{"team": "payments"},
+		}
+		_, err := r.reconcileCephUserSecret(user, userConfig, "")
+		require.NoError(t, err)
+		secret := getSecret(t)
+		assert.NotContains(t, secret.Labels, "tier")
+		assert.Equal(t, "payments", secret.Labels["team"])
+		assert.Empty(t, secret.Annotations)
+	})
+
+	t.Run("a reserved key in the template never overrides Rook's label", func(t *testing.T) {
+		user.Spec.SecretTemplate = cephv1.SecretTemplate{
+			Labels: map[string]cephv1.LabelValue{"app": "other", "rook_object_store": "other"},
+		}
+		secret := r.generateCephUserSecret(user, userConfig, "")
+		assert.Equal(t, rookLabels, secret.Labels)
+	})
+}
+
+func TestResolveAccountRef(t *testing.T) {
+	ctx := t.Context()
+	s := scheme.Scheme
+	s.AddKnownTypes(cephv1.SchemeGroupVersion,
+		&cephv1.CephObjectStoreUser{},
+		&cephv1.CephObjectStoreAccount{},
+		&cephv1.CephObjectStoreAccountList{},
+	)
+
+	t.Run("account not found returns error", func(t *testing.T) {
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:      store,
+				AccountRef: cephv1.ObjectStoreUserAccountRef{Name: "missing-account"},
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(s).Build()
+		r := &ReconcileObjectStoreUser{client: cl, opManagerContext: ctx}
+
+		accountID, result, err := r.resolveAccountRef(u)
+		assert.Error(t, err)
+		assert.Empty(t, accountID)
+		assert.True(t, result.Requeue)
+	})
+
+	t.Run("store mismatch returns error", func(t *testing.T) {
+		account := &cephv1.CephObjectStoreAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-account", Namespace: namespace},
+			Spec: cephv1.ObjectStoreAccountSpec{
+				Store: "different-store",
+			},
+			Status: &cephv1.ObjectStoreAccountStatus{
+				Phase:     k8sutil.ReadyStatus,
+				AccountID: "RGW12345678901234567",
+			},
+		}
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:      store,
+				AccountRef: cephv1.ObjectStoreUserAccountRef{Name: "my-account"},
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(account).Build()
+		r := &ReconcileObjectStoreUser{client: cl, opManagerContext: ctx}
+
+		_, _, err := r.resolveAccountRef(u)
+		assert.Error(t, err)
+	})
+
+	t.Run("account not ready returns error", func(t *testing.T) {
+		account := &cephv1.CephObjectStoreAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-account", Namespace: namespace},
+			Spec: cephv1.ObjectStoreAccountSpec{
+				Store: store,
+			},
+			Status: &cephv1.ObjectStoreAccountStatus{
+				Phase: "",
+			},
+		}
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:      store,
+				AccountRef: cephv1.ObjectStoreUserAccountRef{Name: "my-account"},
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(account).Build()
+		r := &ReconcileObjectStoreUser{client: cl, opManagerContext: ctx}
+
+		accountID, result, err := r.resolveAccountRef(u)
+		assert.Error(t, err)
+		assert.Empty(t, accountID)
+		assert.True(t, result.Requeue)
+	})
+
+	t.Run("account ready returns account ID", func(t *testing.T) {
+		expectedID := "RGW12345678901234567"
+		account := &cephv1.CephObjectStoreAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-account", Namespace: namespace},
+			Spec: cephv1.ObjectStoreAccountSpec{
+				Store: store,
+			},
+			Status: &cephv1.ObjectStoreAccountStatus{
+				Phase:     k8sutil.ReadyStatus,
+				AccountID: expectedID,
+			},
+		}
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:      store,
+				AccountRef: cephv1.ObjectStoreUserAccountRef{Name: "my-account"},
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(account).Build()
+		r := &ReconcileObjectStoreUser{client: cl, opManagerContext: ctx}
+
+		accountID, result, err := r.resolveAccountRef(u)
+		assert.NoError(t, err)
+		assert.Equal(t, expectedID, accountID)
+		assert.False(t, result.Requeue)
+	})
+
+	t.Run("account ready but no account ID returns error", func(t *testing.T) {
+		account := &cephv1.CephObjectStoreAccount{
+			ObjectMeta: metav1.ObjectMeta{Name: "my-account", Namespace: namespace},
+			Spec: cephv1.ObjectStoreAccountSpec{
+				Store: store,
+			},
+			Status: &cephv1.ObjectStoreAccountStatus{
+				Phase:     k8sutil.ReadyStatus,
+				AccountID: "",
+			},
+		}
+		u := &cephv1.CephObjectStoreUser{
+			ObjectMeta: metav1.ObjectMeta{Name: "user1", Namespace: namespace},
+			Spec: cephv1.ObjectStoreUserSpec{
+				Store:      store,
+				AccountRef: cephv1.ObjectStoreUserAccountRef{Name: "my-account"},
+			},
+		}
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(account).Build()
+		r := &ReconcileObjectStoreUser{client: cl, opManagerContext: ctx}
+
+		accountID, result, err := r.resolveAccountRef(u)
+		assert.Error(t, err)
+		assert.Empty(t, accountID)
+		assert.True(t, result.Requeue)
+	})
+}
+
+func TestIsUserSync(t *testing.T) {
+	t.Run("DisplayName same", func(t *testing.T) {
+		a := admin.User{
+			DisplayName: "Alice",
+		}
+		b := admin.User{
+			DisplayName: "Alice",
+		}
+
+		assert.True(t, isUserSync(&a, &b))
+	})
+
+	t.Run("DisplayName different", func(t *testing.T) {
+		a := admin.User{
+			DisplayName: "Apollo",
+		}
+		b := admin.User{
+			DisplayName: "Zeus",
+		}
+
+		assert.False(t, isUserSync(&a, &b))
+	})
+
+	t.Run("MaxBuckets same", func(t *testing.T) {
+		a := admin.User{
+			MaxBuckets: &[]int{500}[0],
+		}
+		b := admin.User{
+			MaxBuckets: &[]int{500}[0],
+		}
+
+		assert.True(t, isUserSync(&a, &b))
+	})
+
+	t.Run("MaxBuckets different", func(t *testing.T) {
+		a := admin.User{
+			MaxBuckets: &[]int{400}[0],
+		}
+		b := admin.User{
+			MaxBuckets: &[]int{600}[0],
+		}
+
+		assert.False(t, isUserSync(&a, &b))
+	})
+
+	t.Run("OpMask same", func(t *testing.T) {
+		a := admin.User{
+			OpMask: "read, write, delete",
+		}
+		b := admin.User{
+			OpMask: "read, write, delete",
+		}
+
+		assert.True(t, isUserSync(&a, &b))
+	})
+
+	t.Run("OpMask different", func(t *testing.T) {
+		a := admin.User{
+			OpMask: "read, write, delete",
+		}
+		b := admin.User{
+			OpMask: "read",
+		}
+
+		assert.False(t, isUserSync(&a, &b))
+	})
+
+	t.Run("DefaultPlacement unmanaged by the target", func(t *testing.T) {
+		a := admin.User{}
+		b := admin.User{
+			DefaultPlacement:    "hot-tier",
+			DefaultStorageClass: "STANDARD_IA",
+		}
+
+		assert.True(t, isUserSync(&a, &b))
+	})
+
+	t.Run("DefaultPlacement same", func(t *testing.T) {
+		a := admin.User{
+			DefaultPlacement: "hot-tier",
+		}
+		b := admin.User{
+			DefaultPlacement: "hot-tier",
+		}
+
+		assert.True(t, isUserSync(&a, &b))
+	})
+
+	t.Run("DefaultPlacement different", func(t *testing.T) {
+		a := admin.User{
+			DefaultPlacement: "hot-tier",
+		}
+		b := admin.User{
+			DefaultPlacement: "cold-tier",
+		}
+
+		assert.False(t, isUserSync(&a, &b))
+	})
+
+	t.Run("DefaultStorageClass unmanaged by the target", func(t *testing.T) {
+		a := admin.User{
+			DefaultPlacement: "hot-tier",
+		}
+		b := admin.User{
+			DefaultPlacement:    "hot-tier",
+			DefaultStorageClass: "STANDARD_IA",
+		}
+
+		assert.True(t, isUserSync(&a, &b))
+	})
+
+	t.Run("DefaultStorageClass STANDARD matches an unset live storage class", func(t *testing.T) {
+		a := admin.User{
+			DefaultPlacement:    "hot-tier",
+			DefaultStorageClass: "STANDARD",
+		}
+		b := admin.User{
+			DefaultPlacement: "hot-tier",
+		}
+
+		assert.True(t, isUserSync(&a, &b))
+	})
+
+	t.Run("DefaultStorageClass embedded in the target matches the split live form", func(t *testing.T) {
+		a := admin.User{
+			DefaultPlacement: "hot-tier/STANDARD_IA",
+		}
+		b := admin.User{
+			DefaultPlacement:    "hot-tier",
+			DefaultStorageClass: "STANDARD_IA",
+		}
+
+		assert.True(t, isUserSync(&a, &b))
+	})
+
+	t.Run("DefaultStorageClass embedded in the target differs from the split live form", func(t *testing.T) {
+		a := admin.User{
+			DefaultPlacement: "hot-tier/STANDARD_IA",
+		}
+		b := admin.User{
+			DefaultPlacement:    "hot-tier",
+			DefaultStorageClass: "GLACIER",
+		}
+
+		assert.False(t, isUserSync(&a, &b))
+	})
+}
+
+func TestUpdateKeyStatusDoesNotLogSecretData(t *testing.T) {
+	// corev1.Secret carries a generated String() method that prints its whole Data
+	// map, and fmt calls it at any nesting depth, so formatting a collection of
+	// Secrets writes every referenced credential to the log.
+	logBuf := bytes.NewBuffer([]byte{})
+	capnslog.SetFormatter(capnslog.NewLogFormatter(logBuf, "", 0))
+	// restore the sink so later tests in this package still log to stderr
+	t.Cleanup(func() { capnslog.SetFormatter(capnslog.NewDefaultFormatter(os.Stderr)) })
+	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
+
+	objectUser := &cephv1.CephObjectStoreUser{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		TypeMeta:   metav1.TypeMeta{Kind: "CephObjectStoreUser"},
+	}
+
+	s := scheme.Scheme
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStoreUser{})
+	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(objectUser).Build()
+	r := &ReconcileObjectStoreUser{client: cl, scheme: s, opManagerContext: context.TODO()}
+
+	//nolint:gosec // only a test value, not a real secret
+	const secretValue = "EXAMPLESECRETKEYVALUE00000000000000000001"
+	referencedSecrets := map[types.UID]*corev1.Secret{
+		"uid-1": {
+			ObjectMeta: metav1.ObjectMeta{
+				Name:            "my-user-keys",
+				Namespace:       namespace,
+				UID:             "uid-1",
+				ResourceVersion: "1",
+			},
+			Data: map[string][]byte{"SecretKey": []byte(secretValue)},
+		},
+	}
+
+	r.updateKeyStatus(types.NamespacedName{Name: name, Namespace: namespace}, &referencedSecrets)
+
+	logOutput := logBuf.String()
+	// Secret.Data is map[string][]byte, which the generated String() renders as
+	// decimal byte values rather than text, so check for that form too
+	assert.NotContains(t, logOutput, secretValue)
+	assert.NotContains(t, logOutput, fmt.Sprintf("%v", []byte(secretValue)))
+	// the secret reference is what the line exists to report, and is still logged
+	assert.Contains(t, logOutput, "my-user-keys")
+}
+
+func TestCreateOrUpdateCephUserDoesNotLogKeySecret(t *testing.T) {
+	// admin.UserKeySpec has plain exported AccessKey and SecretKey fields and no
+	// String() method, so formatting a slice of them prints both halves.
+	logBuf := bytes.NewBuffer([]byte{})
+	capnslog.SetFormatter(capnslog.NewLogFormatter(logBuf, "", 0))
+	// restore the sink so later tests in this package still log to stderr
+	t.Cleanup(func() { capnslog.SetFormatter(capnslog.NewDefaultFormatter(os.Stderr)) })
+	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
+
+	objectUser := &cephv1.CephObjectStoreUser{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec:       cephv1.ObjectStoreUserSpec{Store: store},
+		TypeMeta:   metav1.TypeMeta{Kind: "CephObjectStoreUser"},
+	}
+
+	// A live RGW user the API returned with one key, so createOrUpdateCephUser
+	// falls back to the live user's keys and formats them.
+	//nolint:gosec // only test values, not a real secret
+	const liveSecretKey = "EXAMPLELIVESECRETKEY0000000000000000000001"
+	userWithKeysJSON := `{
+	"user_id": "my-user",
+	"display_name": "my-user",
+	"max_buckets": 1000,
+	"keys": [{"user": "my-user", "access_key": "EXAMPLELIVEACCESSKEY01", "secret_key": "` + liveSecretKey + `"}],
+	"swift_keys": [],
+	"caps": [],
+	"op_mask": "read, write, delete",
+	"bucket_quota": {"enabled": false, "max_size": -1, "max_objects": -1},
+	"user_quota": {"enabled": false, "max_size": -1, "max_objects": -1},
+	"type": "rgw"
+}`
+
+	mockClient := &cephobject.MockClient{
+		MockDo: func(req *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: 200,
+				Body:       io.NopCloser(bytes.NewReader([]byte(userWithKeysJSON))),
+			}, nil
+		},
+	}
+	adminClient, err := admin.New("rook-ceph-rgw-my-store.mycluster.svc", "53S6B9S809NUP19IJ2K3", "1bXPegzsGClvoGAiJdHQD1uOW2sQBLAZM9j9VtXR", mockClient)
+	assert.NoError(t, err)
+	r := &ReconcileObjectStoreUser{
+		objContext:       &cephobject.AdminOpsContext{AdminOpsClient: adminClient},
+		opManagerContext: context.TODO(),
+		clusterInfo:      &cephclient.ClusterInfo{CephVersion: cephver.Minimum},
+	}
+
+	userConfig, err := generateUserConfig(objectUser, cephver.Minimum)
+	require.NoError(t, err)
+	_, err = r.createOrUpdateCephUser(objectUser, userConfig)
+	require.NoError(t, err)
+
+	logOutput := logBuf.String()
+	assert.NotContains(t, logOutput, liveSecretKey)
+	// the reconcile is still traceable by user name
+	assert.Contains(t, logOutput, "my-user")
+}
